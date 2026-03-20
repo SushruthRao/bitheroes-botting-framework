@@ -1,0 +1,38 @@
+{
+  "connection": {
+    "host": "f123.bitheroesgame.com",
+    "port": 9933
+  },
+  "automation": {
+    "autoClaimDailyReward": true,
+    "autoClaimDailyQuests": false,
+    "autoDeclineCaptures": true,
+    "abandonOrphanedDungeon": true,
+    "tutorialHandling": "Warn",
+    "energyWaitMinutes": 10,
+    "maxRetries": 3,
+    "retryDelayMs": 5000
+  },
+  "dungeonQueue": [
+    {
+      "enabled": true,
+      "zoneId": 1,
+      "nodeId": 1,
+      "difficultyId": 0,
+      "useDamageGain": true,
+      "repeatDelayMs": 3000,
+      "maxRuns": -1,
+      "teammates": []
+    }
+  ],
+  "gui": {
+    "enabled": true,
+    "refreshRateMs": 500,
+    "maxLogLines": 15
+  },
+  "logging": {
+    "logToFile": true,
+    "logFile": "bot.log",
+    "verboseMode": true
+  }
+}
