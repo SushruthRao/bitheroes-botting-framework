@@ -44,28 +44,44 @@ public sealed class MainForm : Form
     private CheckBox _autoDailyQuests = null!;
     private CheckBox _autoDecline = null!;
     private CheckBox _abandonOrphaned = null!;
+    private CheckBox _autoAssignTeam = null!;
     private NumericUpDown _energyWait = null!;
     private ComboBox _tutorialHandling = null!;
 
+    // ── Team list (right panel Character tab) ─────────────────────────────────
+
+    private ListView _teamList = null!;
+
     // ── Stats labels (right panel) ─────────────────────────────────────────────
 
-    private Label _stateLabel = null!;
-    private Label _zoneLabel = null!;
-    private Label _waveLabel = null!;
-    private Label _actionLabel = null!;
-    private Label _runtimeLabel = null!;
-    private Label _runsLabel = null!;
-    private Label _itemsLabel = null!;
-    private Label _dailiesLabel = null!;
-    private Label _energyText = null!;
-    private Label _energyRegen = null!;
-    private Label _ticketsText = null!;
-    private Label _ticketsRegen = null!;
-    private Label _goldLabel = null!;
-    private Label _creditsLabel = null!;
-    private Label _shardsLabel = null!;
+    // Bot State
+    private Label _stateLabel      = null!;
+    private Label _zoneLabel       = null!;
+    private Label _enemyProgress   = null!;
+    private Label _waveLabel       = null!;
+    private Label _actionLabel     = null!;
+    private Label _retryLabel      = null!;
+    // Session
+    private Label _runtimeLabel    = null!;
+    private Label _runsLabel       = null!;
+    private Label _encountersLabel = null!;
+    private Label _goldGainedLabel = null!;
+    private Label _expGainedLabel  = null!;
+    private Label _levelLabel      = null!;
+    private Label _itemsLabel      = null!;
+    private Label _dailiesLabel    = null!;
+    // Character
+    private Label _energyText      = null!;
+    private Label _energyRegen     = null!;
+    private Label _ticketsText     = null!;
+    private Label _ticketsRegen    = null!;
+    private Label _goldLabel       = null!;
+    private Label _creditsLabel    = null!;
+    private Label _shardsLabel     = null!;
     private Label _highestZoneLabel = null!;
-    private ListBox _lootList = null!;
+    // Loot feed
+    private ListBox _lootList      = null!;
+    private int     _lootListCount = 0;
 
     // ── Dungeon debug tab ─────────────────────────────────────────────────────
 
@@ -223,24 +239,48 @@ public sealed class MainForm : Form
 
         _logBox = new ListBox
         {
-            Dock         = DockStyle.Fill,
-            BackColor    = Color.FromArgb(18, 18, 18),
-            ForeColor    = Color.FromArgb(200, 200, 200),
-            Font         = new Font("Consolas", 8.5f),
-            BorderStyle  = BorderStyle.None,
-            DrawMode     = DrawMode.OwnerDrawFixed,
-            SelectionMode = SelectionMode.None,
+            Dock                = DockStyle.Fill,
+            BackColor           = Color.FromArgb(18, 18, 18),
+            ForeColor           = Color.FromArgb(200, 200, 200),
+            Font                = new Font("Consolas", 8.5f),
+            BorderStyle         = BorderStyle.None,
+            DrawMode            = DrawMode.OwnerDrawFixed,
+            SelectionMode       = SelectionMode.MultiExtended,
             HorizontalScrollbar = false,
-            ItemHeight   = 15,
+            ItemHeight          = 15,
         };
         _logBox.DrawItem += (_, e) =>
         {
             if (e.Index < 0 || e.Index >= _logBox.Items.Count) return;
-            e.DrawBackground();
+            // Draw selection highlight manually so it stays visible on the dark background
+            bool selected = (e.State & DrawItemState.Selected) != 0;
+            using (var bgBrush = new SolidBrush(selected
+                       ? Color.FromArgb(50, 80, 120)
+                       : Color.FromArgb(18, 18, 18)))
+                e.Graphics.FillRectangle(bgBrush, e.Bounds);
+
             var (color, text) = ((Color, string))_logBox.Items[e.Index]!;
             using var brush = new SolidBrush(color);
             e.Graphics.DrawString(text, e.Font!, brush,
                 new RectangleF(e.Bounds.X + 4, e.Bounds.Y, e.Bounds.Width - 4, e.Bounds.Height));
+        };
+        // Ctrl+C copies selected lines; Ctrl+A selects all
+        _logBox.KeyDown += (_, e) =>
+        {
+            if (e.Control && e.KeyCode == Keys.A)
+            {
+                for (int i = 0; i < _logBox.Items.Count; i++)
+                    _logBox.SetSelected(i, true);
+                e.Handled = true;
+            }
+            else if (e.Control && e.KeyCode == Keys.C)
+            {
+                var lines = _logBox.SelectedItems
+                    .Cast<(Color, string)>()
+                    .Select(t => t.Item2);
+                Clipboard.SetText(string.Join(Environment.NewLine, lines));
+                e.Handled = true;
+            }
         };
 
         outer.Controls.Add(_logBox);
@@ -644,6 +684,7 @@ public sealed class MainForm : Form
         _autoDailyQuests = Chk(panel, "Auto Claim Daily Quests (unverified — keep OFF)", ref y, false);
         _autoDecline = Chk(panel, "Auto Decline Captures", ref y, true);
         _abandonOrphaned = Chk(panel, "Abandon Orphaned Dungeon", ref y, true);
+        _autoAssignTeam = Chk(panel, "Auto-Assign Teammates (strongest available)", ref y, true);
         y += 6;
         SpinRow(panel, "Energy Wait (min, fallback)", ref y, out _energyWait, 0, 120, 10);
         ComboRow(panel, "Tutorial Handling", ref y, out _tutorialHandling,
@@ -653,129 +694,248 @@ public sealed class MainForm : Form
         return tab;
     }
 
-    // ── Right panel: live stats ───────────────────────────────────────────────
+    // ── Right panel: tabbed live stats ───────────────────────────────────────
 
     private void BuildRightPanel(SplitterPanel parent)
     {
-        parent.BackColor = Color.FromArgb(245, 245, 248);
-        parent.Padding = new Padding(4, 8, 8, 8);
+        parent.BackColor = Color.FromArgb(235, 236, 240);
+        parent.Padding   = new Padding(0);
 
-        parent.Controls.Add(BuildLootGroup());
-        parent.Controls.Add(BuildCharacterGroup());
-        parent.Controls.Add(BuildSessionGroup());
-        parent.Controls.Add(BuildBotStateGroup());
+        var tabs = new TabControl
+        {
+            Dock    = DockStyle.Fill,
+            Font    = new Font("Segoe UI", 8.5f),
+            Padding = new Point(8, 4),
+        };
+        tabs.TabPages.Add(BuildStatusTab());
+        tabs.TabPages.Add(BuildSessionTab());
+        tabs.TabPages.Add(BuildCharacterTab());
+        tabs.TabPages.Add(BuildLootTab());
+        parent.Controls.Add(tabs);
     }
 
-    private GroupBox BuildBotStateGroup()
+    private TabPage BuildStatusTab()
     {
-        var g = StyledGroup("Bot State", DockStyle.Top, height: 118);
-        int y = 22;
-        _stateLabel = StatRow(g, "State:", ref y, "IDLE");
-        _zoneLabel = StatRow(g, "Zone:", ref y, "—");
-        _waveLabel = StatRow(g, "Wave:", ref y, "—");
-        _actionLabel = StatRow(g, "Action:", ref y, "—");
-        return g;
+        var tab    = new TabPage("Status") { BackColor = Color.FromArgb(245, 245, 248) };
+        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(8, 6, 8, 6) };
+
+        int y = 8;
+        TabSection(scroll, "Bot State", ref y);
+        _stateLabel    = StatRow(scroll, "State:",      ref y, "IDLE");
+        _zoneLabel     = StatRow(scroll, "Zone/Node:",  ref y, "—");
+        _enemyProgress = StatRow(scroll, "Enemies:",    ref y, "—");
+        _waveLabel     = StatRow(scroll, "Battle #:",   ref y, "—");
+        _actionLabel   = StatRow(scroll, "Action:",     ref y, "—");
+        _retryLabel    = StatRow(scroll, "Retries:",    ref y, "0");
+
+        tab.Controls.Add(scroll);
+        return tab;
     }
 
-    private GroupBox BuildSessionGroup()
+    private TabPage BuildSessionTab()
     {
-        var g = StyledGroup("Session", DockStyle.Top, height: 108);
-        int y = 22;
-        _runtimeLabel = StatRow(g, "Runtime:", ref y, "00:00:00");
-        _runsLabel = StatRow(g, "Runs:", ref y, "0  (0W / 0L)");
-        _itemsLabel = StatRow(g, "Items:", ref y, "0");
-        _dailiesLabel = StatRow(g, "Dailies:", ref y, "0");
-        return g;
+        var tab    = new TabPage("Session") { BackColor = Color.FromArgb(245, 245, 248) };
+        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(8, 6, 8, 6) };
+
+        int y = 8;
+        TabSection(scroll, "Timing", ref y);
+        _runtimeLabel = StatRow(scroll, "Runtime:", ref y, "00:00:00");
+
+        TabSection(scroll, "Dungeon Runs", ref y);
+        _runsLabel = StatRow(scroll, "Runs:",  ref y, "0  (0W / 0L)");
+
+        TabSection(scroll, "Encounters", ref y);
+        _encountersLabel = StatRow(scroll, "Battles:",     ref y, "0  (0W / 0L)");
+        _goldGainedLabel = StatRow(scroll, "Gold Earned:", ref y, "0");
+        _expGainedLabel  = StatRow(scroll, "EXP Earned:",  ref y, "0");
+        _levelLabel      = StatRow(scroll, "Level:",       ref y, "—");
+
+        TabSection(scroll, "Items & Quests", ref y);
+        _itemsLabel   = StatRow(scroll, "Items Looted:", ref y, "0");
+        _dailiesLabel = StatRow(scroll, "Dailies:",       ref y, "0");
+
+        tab.Controls.Add(scroll);
+        return tab;
     }
 
-    private GroupBox BuildCharacterGroup()
+    private TabPage BuildCharacterTab()
     {
-        var g = StyledGroup("Character", DockStyle.Top, height: 178);
-        int y = 22;
+        var tab    = new TabPage("Character") { BackColor = Color.FromArgb(245, 245, 248) };
+        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(8, 6, 8, 6) };
 
-        _energyText = StatRow(g, "Energy:", ref y, "—");
+        int y = 8;
+        TabSection(scroll, "Resources", ref y);
+
+        _energyText = StatRow(scroll, "Energy:", ref y, "—");
         _energyRegen = new Label
         {
-            Text = "",
-            Location = new Point(84, y),
-            AutoSize = true,
+            Text      = "",
+            Location  = new Point(90, y),
+            AutoSize  = true,
             ForeColor = Color.FromArgb(80, 110, 160),
-            Font = new Font("Segoe UI", 7.5f, FontStyle.Italic)
+            Font      = new Font("Segoe UI", 7.5f, FontStyle.Italic)
         };
-        g.Controls.Add(_energyRegen);
-        y += 16;
+        scroll.Controls.Add(_energyRegen);
+        y += 14;
 
-        _ticketsText = StatRow(g, "Tickets:", ref y, "—");
+        _ticketsText = StatRow(scroll, "Tickets:", ref y, "—");
         _ticketsRegen = new Label
         {
-            Text = "",
-            Location = new Point(84, y),
-            AutoSize = true,
+            Text      = "",
+            Location  = new Point(90, y),
+            AutoSize  = true,
             ForeColor = Color.FromArgb(80, 110, 160),
-            Font = new Font("Segoe UI", 7.5f, FontStyle.Italic)
+            Font      = new Font("Segoe UI", 7.5f, FontStyle.Italic)
         };
-        g.Controls.Add(_ticketsRegen);
+        scroll.Controls.Add(_ticketsRegen);
+        y += 14;
+
+        TabSection(scroll, "Currency", ref y);
+        _goldLabel        = StatRow(scroll, "Gold:",       ref y, "—");
+        _creditsLabel     = StatRow(scroll, "Credits:",    ref y, "—");
+        _shardsLabel      = StatRow(scroll, "Shards:",     ref y, "—");
+
+        TabSection(scroll, "Progression", ref y);
+        _highestZoneLabel = StatRow(scroll, "High Zone:",  ref y, "—");
+
+        TabSection(scroll, "Active Team", ref y);
+        scroll.Controls.Add(new Label
+        {
+            Text      = "Slot  Type       ID        P      S      A    Total",
+            Location  = new Point(8, y),
+            AutoSize  = true,
+            ForeColor = Color.FromArgb(100, 100, 115),
+            Font      = new Font("Consolas", 7.5f)
+        });
         y += 16;
 
-        _goldLabel = StatRow(g, "Gold:", ref y, "—");
-        _creditsLabel = StatRow(g, "Credits:", ref y, "—");
-        _shardsLabel = StatRow(g, "Shards:", ref y, "—");
-        _highestZoneLabel = StatRow(g, "High Zone:", ref y, "—");
-        return g;
+        _teamList = new ListView
+        {
+            Location        = new Point(8, y),
+            Size            = new Size(330, 120),
+            View            = View.Details,
+            FullRowSelect   = true,
+            GridLines       = true,
+            MultiSelect     = false,
+            BorderStyle     = BorderStyle.FixedSingle,
+            Font            = new Font("Consolas", 8f),
+            HeaderStyle     = ColumnHeaderStyle.None,
+        };
+        _teamList.Columns.Add("#",     28);
+        _teamList.Columns.Add("Type",  58);
+        _teamList.Columns.Add("ID",    64);
+        _teamList.Columns.Add("Pwr",   36);
+        _teamList.Columns.Add("Sta",   36);
+        _teamList.Columns.Add("Agi",   36);
+        _teamList.Columns.Add("Total", 42);
+        scroll.Controls.Add(_teamList);
+
+        tab.Controls.Add(scroll);
+        return tab;
     }
 
-    private GroupBox BuildLootGroup()
+    private TabPage BuildLootTab()
     {
-        var g = StyledGroup("Recent Loot", DockStyle.Fill);
+        var tab = new TabPage("Loot") { BackColor = Color.FromArgb(16, 20, 28), Padding = new Padding(0) };
+
         _lootList = new ListBox
         {
-            Dock = DockStyle.Fill,
-            Font = new Font("Consolas", 8.5f),
-            BackColor = Color.FromArgb(250, 252, 255),
-            BorderStyle = BorderStyle.None,
+            Dock           = DockStyle.Fill,
+            Font           = new Font("Consolas", 8f),
+            BackColor      = Color.FromArgb(16, 20, 28),
+            ForeColor      = Color.FromArgb(210, 215, 220),
+            BorderStyle    = BorderStyle.None,
             IntegralHeight = false,
-            SelectionMode = SelectionMode.None
+            SelectionMode  = SelectionMode.None,
+            DrawMode       = DrawMode.OwnerDrawFixed,
+            ItemHeight     = 16,
+            HorizontalScrollbar = true,
         };
-        g.Controls.Add(_lootList);
-        return g;
+        _lootList.DrawItem += DrawLootItem;
+        tab.Controls.Add(_lootList);
+        return tab;
+    }
+
+    private static void DrawLootItem(object? sender, DrawItemEventArgs e)
+    {
+        if (sender is not ListBox lb) return;
+        if (e.Index < 0 || e.Index >= lb.Items.Count) return;
+
+        var entry = lb.Items[e.Index] as LootEntry;
+        if (entry == null) return;
+
+        // Row background
+        Color bg = entry.NewLevel > 0
+            ? Color.FromArgb(20, 50, 20)   // level-up = dark green bg
+            : entry.GoldDelta > 0 || entry.Items.Any(i => !i.IsCurrency)
+                ? Color.FromArgb(28, 24, 14) // rewards = dark gold bg
+                : Color.FromArgb(36, 18, 18); // loss = dark red bg
+        using (var bgBrush = new SolidBrush(bg))
+            e.Graphics.FillRectangle(bgBrush, e.Bounds);
+
+        // Row text colour
+        Color fg = entry.NewLevel > 0
+            ? Color.FromArgb(120, 220, 100)
+            : entry.GoldDelta > 0 || entry.Items.Count > 0
+                ? Color.FromArgb(220, 190, 100)
+                : Color.FromArgb(180, 80, 80);
+
+        using var fgBrush = new SolidBrush(fg);
+        e.Graphics.DrawString(entry.Summary(), e.Font!, fgBrush,
+            new RectangleF(e.Bounds.X + 4, e.Bounds.Y + 1, e.Bounds.Width - 4, e.Bounds.Height));
+    }
+
+    // ── Tab layout helpers ────────────────────────────────────────────────────
+
+    private static void TabSection(Panel p, string title, ref int y)
+    {
+        if (y > 8) y += 4;  // spacing above all but first section
+        var lbl = new Label
+        {
+            Text      = title.ToUpperInvariant(),
+            Location  = new Point(8, y),
+            AutoSize  = true,
+            ForeColor = Color.FromArgb(100, 130, 180),
+            Font      = new Font("Segoe UI", 7.5f, FontStyle.Bold),
+        };
+        p.Controls.Add(lbl);
+        y += 18;
+
+        // Thin separator line
+        var line = new Panel
+        {
+            Location  = new Point(8, y),
+            Size      = new Size(200, 1),
+            BackColor = Color.FromArgb(210, 212, 220),
+        };
+        p.Controls.Add(line);
+        y += 5;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private static GroupBox StyledGroup(string title, DockStyle dock, int height = 0)
-    {
-        var g = new GroupBox
-        {
-            Text = title,
-            Dock = dock,
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            ForeColor = Color.FromArgb(60, 60, 80),
-            BackColor = Color.FromArgb(245, 245, 248),
-            Padding = new Padding(6)
-        };
-        if (height > 0) g.Height = height;
-        return g;
-    }
 
-    private static Label StatRow(GroupBox g, string caption, ref int y, string initial)
+
+    private static Label StatRow(Control parent, string caption, ref int y, string initial)
     {
-        const int capW = 72;
+        const int capW = 90;
         var cap = new Label
         {
-            Text = caption,
-            Location = new Point(10, y),
-            Width = capW,
-            ForeColor = Color.Gray,
-            Font = new Font("Segoe UI", 8.5f)
+            Text      = caption,
+            Location  = new Point(8, y),
+            Width     = capW,
+            ForeColor = Color.FromArgb(100, 100, 115),
+            Font      = new Font("Segoe UI", 8.5f)
         };
         var val = new Label
         {
-            Text = initial,
-            Location = new Point(capW + 12, y),
+            Text     = initial,
+            Location = new Point(capW + 10, y),
             AutoSize = true,
-            Font = new Font("Segoe UI", 8.5f)
+            Font     = new Font("Segoe UI", 8.5f, FontStyle.Bold)
         };
-        g.Controls.AddRange(new Control[] { cap, val });
+        parent.Controls.Add(cap);
+        parent.Controls.Add(val);
         y += 22;
         return val;
     }
@@ -937,20 +1097,33 @@ public sealed class MainForm : Form
 
         // ── Bot state ─────────────────────────────────────────────────────────
         _stateLabel.Text = SessionStats.CurrentState;
-        _zoneLabel.Text = SessionStats.CurrentZone > 0
-            ? $"Z{SessionStats.CurrentZone} / N{SessionStats.CurrentNode}"
+
+        int cz = SessionStats.CurrentZone, cn = SessionStats.CurrentNode;
+        _zoneLabel.Text = cz > 0
+            ? $"Z{cz} / N{cn}"
               + (SessionStats.QueueTotal > 1
                     ? $"  [{SessionStats.CurrentQueueIndex + 1}/{SessionStats.QueueTotal}]" : "")
             : "—";
-        _waveLabel.Text = SessionStats.CurrentWave > 0 ? SessionStats.CurrentWave.ToString() : "—";
+
+        int et = SessionStats.EnemiesTotal, ec = SessionStats.EnemiesCleared;
+        _enemyProgress.Text = et > 0 ? $"{ec} / {et} cleared" : "—";
+
+        int cw = SessionStats.CurrentWave;
+        _waveLabel.Text = cw > 0 ? $"Battle #{cw}" : "—";
         _actionLabel.Text = string.IsNullOrEmpty(SessionStats.CurrentAction) ? "—" : SessionStats.CurrentAction;
+        _retryLabel.Text  = SessionStats.RetryCount > 0 ? SessionStats.RetryCount.ToString() : "0";
 
         // ── Session ───────────────────────────────────────────────────────────
         var rt = SessionStats.Runtime;
-        _runtimeLabel.Text = $"{(int)rt.TotalHours:D2}:{rt.Minutes:D2}:{rt.Seconds:D2}";
-        _runsLabel.Text = $"{SessionStats.TotalRuns}  ({SessionStats.Wins}W / {SessionStats.Losses}L)";
-        _itemsLabel.Text = SessionStats.TotalItems.ToString();
-        _dailiesLabel.Text = SessionStats.DailiesClaimed.ToString();
+        _runtimeLabel.Text    = $"{(int)rt.TotalHours:D2}:{rt.Minutes:D2}:{rt.Seconds:D2}";
+        _runsLabel.Text       = $"{SessionStats.TotalRuns}  ({SessionStats.Wins}W / {SessionStats.Losses}L)";
+        _encountersLabel.Text = $"{SessionStats.EncountersWon + SessionStats.EncountersLost}" +
+                                $"  ({SessionStats.EncountersWon}W / {SessionStats.EncountersLost}L)";
+        _goldGainedLabel.Text = SessionStats.GoldGained > 0 ? $"+{SessionStats.GoldGained:N0}" : "0";
+        _expGainedLabel.Text  = SessionStats.ExpGained  > 0 ? $"+{SessionStats.ExpGained:N0}"  : "0";
+        _levelLabel.Text      = SessionStats.Level > 0 ? SessionStats.Level.ToString() : "—";
+        _itemsLabel.Text      = SessionStats.TotalItems.ToString();
+        _dailiesLabel.Text    = SessionStats.DailiesClaimed.ToString();
 
         // ── Character ─────────────────────────────────────────────────────────
         int en = SessionStats.Energy;
@@ -965,19 +1138,45 @@ public sealed class MainForm : Form
         _ticketsRegen.Text = nextTk > DateTime.MinValue
             ? $"next +1 @ {nextTk.ToLocalTime():HH:mm:ss}" : "";
 
-        _goldLabel.Text = SessionStats.Gold > 0 ? SessionStats.Gold.ToString("N0") : "—";
-        _creditsLabel.Text = SessionStats.Credits > 0 ? SessionStats.Credits.ToString("N0") : "—";
-        _shardsLabel.Text = SessionStats.Shards > 0 ? SessionStats.Shards.ToString("N0") : "—";
+        _goldLabel.Text        = SessionStats.Gold    > 0 ? SessionStats.Gold.ToString("N0")    : "—";
+        _creditsLabel.Text     = SessionStats.Credits > 0 ? SessionStats.Credits.ToString("N0") : "—";
+        _shardsLabel.Text      = SessionStats.Shards  > 0 ? SessionStats.Shards.ToString("N0")  : "—";
         _highestZoneLabel.Text = SessionStats.HighestZone > 0 ? SessionStats.HighestZone.ToString() : "—";
 
-        // ── Recent loot ───────────────────────────────────────────────────────
-        var loot = SessionStats.RecentLoot;
-        if (loot.Count != _lootList.Items.Count)
+        // ── Team list ─────────────────────────────────────────────────────────
+        var team = SessionStats.CurrentTeam;
+        if (team.Count != _teamList.Items.Count ||
+            (team.Count > 0 && team[0].Id.ToString() != (_teamList.Items.Count > 0 ? _teamList.Items[0].SubItems[2].Text : "")))
         {
+            _teamList.Items.Clear();
+            for (int i = 0; i < team.Count; i++)
+            {
+                var t = team[i];
+                var item = new ListViewItem((i + 1).ToString());
+                item.SubItems.Add(t.TypeName);
+                item.SubItems.Add(t.Id.ToString());
+                item.SubItems.Add(t.Power   > 0 ? t.Power.ToString()   : "—");
+                item.SubItems.Add(t.Stamina > 0 ? t.Stamina.ToString() : "—");
+                item.SubItems.Add(t.Agility > 0 ? t.Agility.ToString() : "—");
+                item.SubItems.Add(t.Total   > 0 ? t.Total.ToString()   : "—");
+                item.ForeColor = t.Type == 2
+                    ? Color.FromArgb(120, 80, 180)   // familiar = purple
+                    : Color.FromArgb(30, 100, 170);  // player   = blue
+                _teamList.Items.Add(item);
+            }
+        }
+
+        // ── Loot feed ─────────────────────────────────────────────────────────
+        var loot = SessionStats.RecentLoot;
+        if (loot.Count != _lootListCount)
+        {
+            _lootListCount = loot.Count;
             _lootList.BeginUpdate();
             _lootList.Items.Clear();
-            foreach (var item in loot) _lootList.Items.Add(item);
+            foreach (var entry in loot) _lootList.Items.Add(entry);
             _lootList.EndUpdate();
+            if (_lootList.Items.Count > 0)
+                _lootList.TopIndex = _lootList.Items.Count - 1;
         }
 
         // ── Log lines ─────────────────────────────────────────────────────────
@@ -1038,6 +1237,7 @@ public sealed class MainForm : Form
         _autoDailyQuests.Checked = _config.Automation.AutoClaimDailyQuests;
         _autoDecline.Checked = _config.Automation.AutoDeclineCaptures;
         _abandonOrphaned.Checked = _config.Automation.AbandonOrphanedDungeon;
+        _autoAssignTeam.Checked = _config.Automation.AutoAssignTeammates;
         _energyWait.Value = Math.Clamp(_config.Automation.EnergyWaitMinutes, 0, 120);
         _tutorialHandling.SelectedIndex = (int)_config.Automation.TutorialHandling;
     }
@@ -1050,6 +1250,7 @@ public sealed class MainForm : Form
         _config.Automation.AutoClaimDailyQuests = _autoDailyQuests.Checked;
         _config.Automation.AutoDeclineCaptures = _autoDecline.Checked;
         _config.Automation.AbandonOrphanedDungeon = _abandonOrphaned.Checked;
+        _config.Automation.AutoAssignTeammates = _autoAssignTeam.Checked;
         _config.Automation.EnergyWaitMinutes = (int)_energyWait.Value;
         _config.Automation.TutorialHandling = (TutorialHandling)_tutorialHandling.SelectedIndex;
     }

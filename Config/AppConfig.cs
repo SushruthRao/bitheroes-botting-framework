@@ -40,6 +40,13 @@ public sealed class AutomationConfig
     /// <summary>Auto-decline familiar capture prompts during battle.</summary>
     public bool AutoDeclineCaptures { get; set; } = true;
 
+    /// <summary>
+    /// Before each dungeon, automatically pick the strongest available teammates
+    /// (online friends sorted by Power+Stamina+Agility, then owned familiars),
+    /// matching the in-game Auto button logic. When false the saved PVE team is used.
+    /// </summary>
+    public bool AutoAssignTeammates { get; set; } = true;
+
     /// <summary>Cancel orphaned dungeon sessions on login rather than resuming them.</summary>
     public bool AbandonOrphanedDungeon { get; set; } = true;
 

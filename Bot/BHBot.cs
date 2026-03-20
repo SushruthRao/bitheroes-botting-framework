@@ -92,6 +92,7 @@ public static class BHBot
     // DALC IDs (dal0 field) — see CLAUDE.md for full registry
     const int DALC_GAME      = 0;
     const int DALC_CHARACTER = 1;
+    const int DALC_FRIEND    = 3;
     const int DALC_USER      = 4;
     const int DALC_CHAT      = 8;
     const int DALC_GUILD     = 9;
@@ -135,9 +136,25 @@ public static class BHBot
     // DungeonExtension act0=1 packets for our own character vs other players.
     static int _myCharId = -1;
 
-    // PVE team auto-detected from server's cha62 character data.
-    // Used when DungeonConfig.Teammates is empty (the default).
+    // PVE team and TeamRules — populated from cha62 (Teams.fromSFSObject equivalent).
+    // TeamRules carries the slot count and toggle flags used by getAutoAssignedTeam.
+    // Default matches the SlothfulBot hardcoded value: new TeamRules(3, 3, true, true, true, false, false).
+    private record PveTeamRules(int Slots, int Size,
+        bool AllowFamiliars, bool AllowFriends, bool AllowGuildmates,
+        bool StatBalance, bool AllowPlayerMultiHero)
+    {
+        public static readonly PveTeamRules Default = new(3, 3, true, true, true, false, false);
+    }
+    static PveTeamRules      _pveTeamRules   = PveTeamRules.Default;
     static List<TeammateConfig> _savedTeammates = new();
+
+    // Friends (cha13) and guildmates (gui5) — charId, base stats, online flag.
+    private record FriendInfo(int CharId, int Power, int Stamina, int Agility, bool Online);
+    static List<FriendInfo> _knownFriends    = new();
+    static List<FriendInfo> _knownGuildmates = new();
+
+    // Owned familiar IDs parsed from fam0 — one entry per unique familiar type.
+    static List<int>        _ownedFamiliars  = new();
 
     // Daily quest work queue
     static readonly Queue<DailyQuestEntry> _questsToLoot = new();
@@ -398,11 +415,6 @@ public static class BHBot
     {
         AssertInGame();
 
-        // CharacterDALC act0=12 — lineup/team confirmation.
-        // The real client always sends this immediately before ENTER_ZONE_NODE.
-        // Without it the server kicks the client ~1 s after zone entry.
-        SendCharacterLineup(cfg);
-
         var p = Packet(DALC_GAME, 5);
         p.PutInt("zon0", cfg.ZoneId);
         p.PutInt("zon1", cfg.NodeId);
@@ -623,10 +635,21 @@ public static class BHBot
         if (evt.Params["room"] is not Room room) return;
         Logger.Info($"[ROOM] Joined room: id={room.Id} name={room.Name}");
         _dungeonRoom = room;
-        // We are now in the dungeon room — ENTER_DUNGEON (act0=1) will arrive shortly
-        _auto = AutoState.WaitingForBattle;
-        _lastBattleEvent = DateTime.UtcNow;
-        SessionStats.SetState("WaitingForBattle", $"Dungeon room joined (id={room.Id})");
+
+        // Only transition to WaitingForBattle when we explicitly sent a JoinRoomRequest
+        // while entering a dungeon (act0=5 with roo1 field).  Any other room join —
+        // e.g. the server auto-moving us to the instance hub (I:NNN) after dungeon
+        // completion — must NOT override the current state (CooldownBeforeRepeat, etc.).
+        if (_auto == AutoState.EnteringDungeon)
+        {
+            _auto = AutoState.WaitingForBattle;
+            _lastBattleEvent = DateTime.UtcNow;
+            SessionStats.SetState("WaitingForBattle", $"Dungeon room joined (id={room.Id})");
+        }
+        else
+        {
+            Logger.Debug($"[ROOM] Room joined in state {_auto} — not changing auto state.");
+        }
     }
 
     static void OnRoomJoinError(BaseEvent evt)
@@ -708,6 +731,7 @@ public static class BHBot
                 case DALC_BATTLE:    HandleBattleDALC(resp, act);    break;
                 case DALC_CHAT:      HandleChatDALC(resp, act);      break;
                 case DALC_GUILD:     HandleGuildDALC(resp, act);     break;
+                case DALC_FRIEND:    HandleFriendDALC(resp, act);    break;
                 default:
                     Logger.Debug($"Unhandled dal0={dalc} act0={act}");
                     break;
@@ -758,21 +782,15 @@ public static class BHBot
         if (err == ServerError.NO_ENERGY &&
             (_auto == AutoState.EnteringDungeon || _auto == AutoState.WaitingForBattle))
         {
+            const int energyPollMs = 120_000; // re-check every 2 minutes
             var nextRegen = SessionStats.NextEnergyAt;
-            int waitMs;
             if (nextRegen > DateTime.MinValue && nextRegen > DateTime.UtcNow)
-            {
-                waitMs = (int)(nextRegen - DateTime.UtcNow).TotalMilliseconds + 5_000;
-                Logger.Warn($"Out of energy. Waiting until {nextRegen:HH:mm:ss} UTC for regen (+5s buffer).");
-            }
+                Logger.Warn($"Out of energy. Next regen at {nextRegen.ToLocalTime():HH:mm:ss}. Checking again in 2 min.");
             else
-            {
-                waitMs = _config.Automation.EnergyWaitMinutes * 60_000;
-                Logger.Warn($"Out of energy. Waiting {_config.Automation.EnergyWaitMinutes} min (no regen data yet).");
-            }
+                Logger.Warn($"Out of energy. Checking again in 2 min.");
             _auto = AutoState.EnergyWait;
-            SessionStats.SetState("EnergyWait", "Waiting for energy regen");
-            ScheduleCooldown(waitMs, AutoState.EnteringDungeon);
+            SessionStats.SetState("EnergyWait", "Out of energy — checking every 2 min");
+            ScheduleCooldown(energyPollMs, AutoState.EnteringDungeon);
             return;
         }
 
@@ -780,21 +798,15 @@ public static class BHBot
         if (err == ServerError.NO_TICKETS &&
             (_auto == AutoState.EnteringDungeon || _auto == AutoState.WaitingForBattle))
         {
+            const int ticketPollMs = 120_000; // re-check every 2 minutes
             var nextRegen = SessionStats.NextTicketAt;
-            int waitMs;
             if (nextRegen > DateTime.MinValue && nextRegen > DateTime.UtcNow)
-            {
-                waitMs = (int)(nextRegen - DateTime.UtcNow).TotalMilliseconds + 5_000;
-                Logger.Warn($"Out of tickets. Waiting until {nextRegen:HH:mm:ss} UTC for regen (+5s buffer).");
-            }
+                Logger.Warn($"Out of tickets. Next regen at {nextRegen.ToLocalTime():HH:mm:ss}. Checking again in 2 min.");
             else
-            {
-                waitMs = _config.Automation.EnergyWaitMinutes * 60_000;
-                Logger.Warn($"Out of tickets. Waiting {_config.Automation.EnergyWaitMinutes} min (no regen data yet).");
-            }
+                Logger.Warn($"Out of tickets. Checking again in 2 min.");
             _auto = AutoState.EnergyWait;
-            SessionStats.SetState("EnergyWait", "Waiting for ticket regen");
-            ScheduleCooldown(waitMs, AutoState.EnteringDungeon);
+            SessionStats.SetState("EnergyWait", "Out of tickets — checking every 2 min");
+            ScheduleCooldown(ticketPollMs, AutoState.EnteringDungeon);
             return;
         }
 
@@ -817,17 +829,8 @@ public static class BHBot
             case AutoState.WaitingForBattle:
                 _retryCount++;
                 SessionStats.SetRetryCount(_retryCount);
-                if (_retryCount >= _config.Automation.MaxRetries)
-                {
-                    Logger.Error($"Dungeon entry failed {_retryCount} times. Idling.");
-                    _auto = AutoState.Idle;
-                    SessionStats.SetState("Idle", "Max retries reached");
-                }
-                else
-                {
-                    Logger.Warn($"Dungeon entry error (retry {_retryCount}/{_config.Automation.MaxRetries}).");
-                    ScheduleCooldown(_config.Automation.RetryDelayMs, AutoState.EnteringDungeon);
-                }
+                Logger.Warn($"Dungeon entry error (retry {_retryCount}). Retrying in {_config.Automation.RetryDelayMs}ms.");
+                ScheduleCooldown(_config.Automation.RetryDelayMs, AutoState.EnteringDungeon);
                 break;
 
             case AutoState.AutoBattleActive:
@@ -910,24 +913,19 @@ public static class BHBot
                     Logger.Debug($"cha11 feature flags ({flags.Length}): [{string.Join(", ", flags)}]");
                 }
 
-                // cha62 carries the character's saved teams (all types).
-                // Extract the PVE team (team0=1) for use in dungeon entry packets.
-                ParseAndStorePveTeam(r);
+                // The LOGIN_PLATFORM response contains the full character data:
+                // cha13 (friends), cha16 (inventory/familiars), cha62 (saved teams).
+                // Main.cs:OnLoginPlatform stores this sfsob and calls Character.fromSFSObject
+                // on it — so all team data we need is right here.
+                ScanForTeamData(r);
 
-                if (_playerId != -1)
-                {
-                    _login = LoginState.LoadingXmls;
-                    SendLoadXmlsPacket();
-                }
-                else
-                {
-                    Logger.Error("No playerID in LOGIN_PLATFORM response. Dump:");
-                    Logger.Info(r.GetDump());
-                }
+                _login = LoginState.LoadingXmls;
+                SendLoadXmlsPacket();
                 break;
 
             default:
-                Logger.Debug($"PlayerDALC act0={act}");
+                Logger.Debug($"PlayerDALC act0={act} keys: {string.Join(", ", r.GetKeys())}");
+                ScanForTeamData(r);
                 break;
         }
     }
@@ -943,10 +941,7 @@ public static class BHBot
                 Logger.Info("In-game. Beginning automation sequence.");
                 SessionStats.SetState("InGame");
                 TryParseCurrency(r);
-                // Some server configurations embed character data in LOAD_XMLS.
-                // Parse cha62 here as a fallback in case it wasn't in LOGIN_PLATFORM.
-                if (_savedTeammates.Count == 0)
-                    ParseAndStorePveTeam(r);
+                ScanForTeamData(r);
                 OnInGame?.Invoke();
                 BeginAutomation();
                 break;
@@ -972,9 +967,17 @@ public static class BHBot
                 OnEnterBattle(r);
                 break;
 
-            case 1: // ENTER_DUNGEON  — server→client dungeon session active (zone dungeon)
-            case 2: // ENTER_INSTANCE — server→client dungeon session active (instance dungeon, room name "I:NNN")
+            case 1: // ENTER_DUNGEON — server→client dungeon session active (zone dungeon)
+            case 2: // ENTER_INSTANCE — only treat as dungeon if it carries dun0 grid data.
+                    // Without dun0 this is a PvP/raid/room notification — ignore it completely.
             {
+                if (act == 2 && !r.ContainsKey("dun0"))
+                {
+                    Logger.Debug("[GAME] ENTER_INSTANCE (no dungeon grid) — not a dungeon, ignoring.");
+                    TryParseCurrency(r);
+                    break;
+                }
+
                 string label = act == 1 ? "ENTER_DUNGEON" : "ENTER_INSTANCE";
                 Logger.Info($"[DUNGEON] {label} received — session active");
 
@@ -994,6 +997,7 @@ public static class BHBot
                 // ENTER_DUNGEON (act0=1) carries the full dun0 array for a zone-based dungeon.
                 // Always do a clean parse here — this is the authoritative initial state.
                 ParseDungeonState(r, clearFirst: true);
+                UpdateEnemyProgress();
 
                 // Notify GUI with parsed object list
                 OnDungeonLoaded?.Invoke(_dungeonObjects.AsReadOnly());
@@ -1017,9 +1021,10 @@ public static class BHBot
                 Logger.Info($"[NOTIFY] {note}");
                 break;
 
-            case 4: // GAME_UPDATE
+            case 4: // GAME_UPDATE — server-push character state; may carry cha13/cha16
                 Logger.Debug("[GAME_UPDATE] received");
                 TryParseCurrency(r);
+                ScanForTeamData(r);
                 break;
 
             case 5: // Dual-use: (a) zone-entry ACK before dungeon, (b) energy update once inside
@@ -1100,6 +1105,9 @@ public static class BHBot
     // CharacterDALC (dal0=1)
     static void HandleCharacterDALC(SFSObject r, int act)
     {
+        // Any CharacterDALC response may carry cha13 (friends) or fam0 (familiars).
+        ScanForTeamData(r);
+
         switch (act)
         {
             case 5: // DAILY_REWARD
@@ -1122,6 +1130,13 @@ public static class BHBot
 
             case 0x4E: // UPDATE_DAILY_REWARDS_CONSUMABLE_PERIODIC
                 Logger.Debug("Daily consumable rewards refreshed.");
+                break;
+
+            case 0xC: // SAVE_TEAM — server echoes the saved team back (team0 + tmts0).
+                    // Mirrors Project.OnSaveTeam: TeamData.fromSFSObject reads team0 (type)
+                    // and tmts0 (SFSArray of {tmts1:id, tmts2:type}). This is the format
+                    // TeamWindow uses after the user saves their lineup.
+                ParseSaveTeamResponse(r);
                 break;
 
             case 0x14: // INVENTORY_CHECK
@@ -1167,8 +1182,13 @@ public static class BHBot
                 bool hasVictory    = false;
                 bool hasDefeat     = false;
                 bool hasResults    = false;
+                bool hasTurnStart  = false;  // 0x07 = server is waiting for our action
                 bool resultsIsWin  = false;  // bat47 value inside 0x15 event
                 int  captureEntity = -1;     // bat7 from 0x0F CaptureSet event
+                List<LootItem> battleLoot = new();
+                long victoryGoldAfter = -1;  // chal9 from 0x0B event (absolute total)
+                long victoryExpAfter  = -1;  // cha5  from 0x0B event (absolute total)
+                int  victoryLevel     = -1;  // cha4  from 0x0B event
 
                 if (r.ContainsKey("bat3"))
                 {
@@ -1183,15 +1203,35 @@ public static class BHBot
                             Logger.Debug($"[BATTLE]   bat3[{i}] act0=0x{evAct:X}");
                             switch (evAct)
                             {
+                                case 0x7:  hasTurnStart = true; break;
                                 case 0xA:  hasComplete  = true; break;
-                                case 0xB:  hasVictory   = true; break;
-                                case 0xC:  hasDefeat    = true; break;
-                                case 0xF:  // DoActionCaptureSet — familiar capture prompt
-                                    captureEntity = ev.ContainsKey("bat7") ? ev.GetInt("bat7") : 0;
+                                case 0xB:
+                                    hasVictory = true;
+                                    // Loot and reward fields sit in the 0x0B event object
+                                    // (DoActionVictory reads them from the same SFSObject).
+                                    battleLoot        = ParseLootItems(ev);
+                                    if (ev.ContainsKey("chal9")) victoryGoldAfter = ev.GetLong("chal9");
+                                    if (ev.ContainsKey("cha5"))  victoryExpAfter  = ev.GetLong("cha5");
+                                    if (ev.ContainsKey("cha4"))  victoryLevel     = ev.GetInt("cha4");
                                     break;
-                                case 0x15: // DoActionResults — dungeon combined result
+                                case 0xC:  hasDefeat    = true; break;
+                                case 0xF: // DoActionCaptureSet
+                                    // bat33=true  → entity added to capture list   → need to decline/accept
+                                    // bat33=false → entity removed from capture list → capture resolved, do nothing
+                                    if (ev.ContainsKey("bat33") && ev.GetBool("bat33"))
+                                        captureEntity = ev.ContainsKey("bat7") ? ev.GetInt("bat7") : 0;
+                                    break;
+                                case 0x15:
                                     hasResults   = true;
                                     resultsIsWin = ev.ContainsKey("bat47") && ev.GetBool("bat47");
+                                    // 0x15 may also carry loot if 0x0B was absent
+                                    if (!hasVictory && resultsIsWin)
+                                    {
+                                        battleLoot        = ParseLootItems(ev);
+                                        if (ev.ContainsKey("chal9")) victoryGoldAfter = ev.GetLong("chal9");
+                                        if (ev.ContainsKey("cha5"))  victoryExpAfter  = ev.GetLong("cha5");
+                                        if (ev.ContainsKey("cha4"))  victoryLevel     = ev.GetInt("cha4");
+                                    }
                                     break;
                             }
                         }
@@ -1220,18 +1260,52 @@ public static class BHBot
                     string tag = hasVictory ? "0x0B" : hasResults ? "0x15" : "0x0C";
                     _auto = AutoState.WaitingForBattle;
                     _lastBattleEvent = DateTime.UtcNow;
+
+                    // ── Record encounter result with loot ─────────────────────
                     if (win)
                     {
-                        // Real client: onCompleteBattleTransitionComplete → CheckAutoPilot → DoObjectActivate.
-                        // The server sends OBJECT_REMOVE only AFTER it receives the next DoObjectActivate,
-                        // not automatically after battle end. Send activate immediately to unblock the server.
-                        Logger.Info($"[BATTLE] Encounter WON ({tag}) — sending DoObjectActivate for next enemy.");
+                        // Calculate gold/exp deltas by comparing pre- and post-battle absolutes.
+                        long goldDelta = victoryGoldAfter >= 0 && SessionStats.Gold > 0
+                            ? Math.Max(0, victoryGoldAfter - SessionStats.Gold) : 0;
+                        long expDelta  = victoryExpAfter  >= 0 && SessionStats.Exp  > 0
+                            ? Math.Max(0, victoryExpAfter  - SessionStats.Exp)  : 0;
+                        int  levelUp   = victoryLevel > SessionStats.Level && victoryLevel > 0
+                            ? victoryLevel : 0;
+
+                        var cfg = GetCurrentDungeon();
+                        var entry = new LootEntry
+                        {
+                            Time      = DateTime.UtcNow,
+                            ZoneId    = cfg.ZoneId,
+                            NodeId    = cfg.NodeId,
+                            GoldDelta = goldDelta,
+                            ExpDelta  = expDelta,
+                            NewLevel  = levelUp,
+                            Items     = battleLoot,
+                        };
+                        SessionStats.RecordEncounter(win: true, entry);
+
+                        // Update absolute exp/gold/level in SessionStats so next delta is correct.
+                        if (victoryGoldAfter >= 0) SessionStats.UpdateCurrency(gold: victoryGoldAfter);
+                        if (victoryExpAfter  >= 0) SessionStats.UpdateExpAndLevel(exp: victoryExpAfter);
+                        if (victoryLevel     >  0) SessionStats.UpdateExpAndLevel(level: victoryLevel);
+
+                        string lootSummary = entry.Summary();
+                        Logger.Info($"[BATTLE] Encounter WON ({tag}) — {lootSummary}");
+                        foreach (var item in battleLoot)
+                            Logger.Info($"  [LOOT] {item}");
+
+                        // Real client: CheckAutoPilot → DoObjectActivate for next enemy.
                         SendDungeonActivate();
                     }
                     else
                     {
-                        // Defeat: wait for DungeonExtension PLAYER_DEFEAT broadcast (act0=2).
-                        // Our case-2 handler will call SendPlayerExit from there.
+                        SessionStats.RecordEncounter(win: false, new LootEntry
+                        {
+                            Time = DateTime.UtcNow,
+                            ZoneId = GetCurrentDungeon().ZoneId,
+                            NodeId = GetCurrentDungeon().NodeId,
+                        });
                         Logger.Info($"[BATTLE] Encounter LOST ({tag}) — awaiting PLAYER_DEFEAT broadcast.");
                     }
                 }
@@ -1253,16 +1327,23 @@ public static class BHBot
                     DeclineCapture(captureEntity);
                     _auto = AutoState.AutoBattleActive;
                 }
+                else if (hasTurnStart)
+                {
+                    // 0x07 (DoActionTurnStart): server is explicitly waiting for our move.
+                    // Respond with AUTO so it handles our turn automatically.
+                    Logger.Info($"[BATTLE] TurnStart (0x07) — sending AUTO (battle {_waveCount}).");
+                    _auto = AutoState.AutoBattleActive;
+                    SessionStats.SetState("AutoBattleActive", $"AUTO turn (battle {_waveCount})");
+                    SendBattleAuto(GetCurrentDungeon().UseDamageGain);
+                }
                 else
                 {
-                    // No terminal event and no capture — battle ongoing (multi-round AUTO).
-                    // 0x07 (DoActionTurnStart) signals it is the player's turn.
-                    // Send AUTO; server processes the round and replies with another QUEUE.
-                    int battleNum = _waveCount;
-                    Logger.Info($"[BATTLE] Round ongoing — sending AUTO (battle {battleNum}).");
+                    // Animation-only QUEUE (0x06 ability, 0x02 health change, etc.).
+                    // In AUTO mode the initial AUTO told the server to handle the entire encounter.
+                    // These are just animation events — the server continues on its own.
+                    // No response needed; wait for 0xA (Complete) or 0xB/0xC/0x15 (terminal).
+                    Logger.Debug($"[BATTLE] Animation QUEUE (battle {_waveCount}) — waiting for completion.");
                     _auto = AutoState.AutoBattleActive;
-                    SessionStats.SetState("AutoBattleActive", $"AUTO (battle {battleNum})");
-                    SendBattleAuto(GetCurrentDungeon().UseDamageGain);
                 }
                 break;
             }
@@ -1351,8 +1432,11 @@ public static class BHBot
     }
 
     // GuildDALC (dal0=9)
-    static void HandleGuildDALC(SFSObject r, int act) =>
+    static void HandleGuildDALC(SFSObject r, int act)
+    {
         Logger.Debug($"GuildDALC act0={act}");
+        ScanForTeamData(r);
+    }
 
     // DungeonExtension — server→client events sent to the dungeon room (no dal0 field).
     // action constants match DungeonExtension.ParseSFSObject() switch in the decompiled client.
@@ -1658,29 +1742,25 @@ public static class BHBot
         // so these guards only fire once we have confirmed currency state from the server.
         if (SessionStats.Energy == 0 && SessionStats.NextEnergyAt > DateTime.MinValue)
         {
+            const int pollMs = 120_000;
             var next = SessionStats.NextEnergyAt;
-            int waitMs = next > DateTime.UtcNow
-                ? (int)(next - DateTime.UtcNow).TotalMilliseconds + 5_000
-                : _config.Automation.EnergyWaitMinutes * 60_000;
             Logger.Warn($"Energy is 0 — skipping entry. " +
-                        $"Next regen: {(next > DateTime.UtcNow ? next.ToString("HH:mm:ss") + " UTC" : "unknown")}.");
+                        $"Next regen: {(next > DateTime.UtcNow ? next.ToLocalTime().ToString("HH:mm:ss") : "unknown")}. Checking again in 2 min.");
             _auto = AutoState.EnergyWait;
-            SessionStats.SetState("EnergyWait", "Waiting for energy regen");
-            ScheduleCooldown(waitMs, AutoState.EnteringDungeon);
+            SessionStats.SetState("EnergyWait", "Out of energy — checking every 2 min");
+            ScheduleCooldown(pollMs, AutoState.EnteringDungeon);
             return;
         }
 
         if (SessionStats.Tickets == 0 && SessionStats.NextTicketAt > DateTime.MinValue)
         {
+            const int pollMs = 120_000;
             var next = SessionStats.NextTicketAt;
-            int waitMs = next > DateTime.UtcNow
-                ? (int)(next - DateTime.UtcNow).TotalMilliseconds + 5_000
-                : _config.Automation.EnergyWaitMinutes * 60_000;
             Logger.Warn($"Tickets are 0 — skipping entry. " +
-                        $"Next regen: {(next > DateTime.UtcNow ? next.ToString("HH:mm:ss") + " UTC" : "unknown")}.");
+                        $"Next regen: {(next > DateTime.UtcNow ? next.ToLocalTime().ToString("HH:mm:ss") : "unknown")}. Checking again in 2 min.");
             _auto = AutoState.EnergyWait;
-            SessionStats.SetState("EnergyWait", "Waiting for ticket regen");
-            ScheduleCooldown(waitMs, AutoState.EnteringDungeon);
+            SessionStats.SetState("EnergyWait", "Out of tickets — checking every 2 min");
+            ScheduleCooldown(pollMs, AutoState.EnteringDungeon);
             return;
         }
 
@@ -1856,13 +1936,7 @@ public static class BHBot
                 ResetDungeonState();
                 _retryCount++;
                 SessionStats.SetRetryCount(_retryCount);
-                if (_retryCount >= _config.Automation.MaxRetries)
-                {
-                    Logger.Error("ENTER_DUNGEON never arrived. Max retries reached. Idling.");
-                    _auto = AutoState.Idle;
-                    SessionStats.SetState("Idle", "ENTER_DUNGEON timeout");
-                }
-                else
+                Logger.Warn($"[DUNGEON] ENTER_DUNGEON timeout (retry {_retryCount}). Retrying in {_config.Automation.RetryDelayMs}ms.");
                 {
                     ScheduleCooldown(_config.Automation.RetryDelayMs, AutoState.EnteringDungeon);
                 }
@@ -2155,20 +2229,383 @@ public static class BHBot
             {
                 var o = _dungeonObjects[i];
                 _dungeonObjects[i] = o with { Used = true };
+                UpdateEnemyProgress();
                 return;
             }
         }
     }
 
+    static void UpdateEnemyProgress()
+    {
+        int total   = _dungeonObjects.Count(o => o.Type is 0 or 2); // ENEMY or BOSS
+        int cleared = _dungeonObjects.Count(o => o.Type is 0 or 2 && o.Used);
+        SessionStats.SetEnemyProgress(cleared, total);
+    }
+
+    /// <summary>
+    /// Parse the ite3 SFSArray (item drop list) from a packet object.
+    /// Each element: ite0=ItemId, ite1=ItemType, ite2=Qty.
+    /// </summary>
+    static List<LootItem> ParseLootItems(ISFSObject r)
+    {
+        var items = new List<LootItem>();
+        if (!r.ContainsKey("ite3")) return items;
+        try
+        {
+            var arr = r.GetSFSArray("ite3");
+            for (int i = 0; i < arr.Size(); i++)
+            {
+                var obj = arr.GetSFSObject(i);
+                if (obj == null) continue;
+                items.Add(new LootItem
+                {
+                    ItemId   = obj.ContainsKey("ite0") ? obj.GetInt("ite0") : 0,
+                    ItemType = obj.ContainsKey("ite1") ? obj.GetInt("ite1") : 0,
+                    Qty      = obj.ContainsKey("ite2") ? obj.GetInt("ite2") : 1,
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug($"[LOOT] ParseLootItems error: {ex.Message}");
+        }
+        return items;
+    }
+
     /// <summary>
     /// Returns the teammate list to use for a dungeon run.
-    /// Priority: explicit config list → auto-detected PVE team from server → empty (server uses saved team).
+    /// Priority: explicit config list → auto-assign (if enabled and data available)
+    ///           → saved PVE team → empty (server uses its own saved team).
     /// </summary>
     static List<TeammateConfig> GetEffectiveTeammates(DungeonConfig cfg)
     {
         if (cfg.Teammates.Count > 0) return cfg.Teammates;
-        if (_savedTeammates.Count > 0) return _savedTeammates;
-        return cfg.Teammates; // empty → server falls back to its own saved team
+
+        Logger.Info($"[TEAM] Roster: friends={_knownFriends.Count} guildmates={_knownGuildmates.Count} familiars={_ownedFamiliars.Count} savedTeam={_savedTeammates.Count}");
+
+        if (_config.Automation.AutoAssignTeammates)
+        {
+            // Always build the auto team — mirrors getAutoAssignedTeam() which always includes
+            // self at slot 0, then fills remaining slots with the strongest available friends
+            // and familiars. When no friends/familiars are known, returns [self] only.
+            var auto = BuildAutoTeam();
+            SessionStats.SetTeam(auto.Select(t =>
+            {
+                var fi = _knownFriends.FirstOrDefault(f => f.CharId == t.Id);
+                return new TeammateInfo(t.Id, t.Type,
+                    fi?.Power ?? 0, fi?.Stamina ?? 0, fi?.Agility ?? 0,
+                    Online: fi != null ? fi.Online : true);
+            }).ToArray());
+            return auto;
+        }
+
+        if (_savedTeammates.Count > 0)
+        {
+            SessionStats.SetTeam(_savedTeammates.Select(t => new TeammateInfo(t.Id, t.Type, 0, 0, 0)).ToArray());
+            return _savedTeammates;
+        }
+
+        // Last resort: send self at minimum — mirrors getAutoAssignedTeam which always inserts
+        // self at index 0. tmts0 is always sent (listToSFSObject never produces an empty packet).
+        if (_myCharId > 0)
+        {
+            Logger.Debug("[TEAM] No saved team data yet — sending self-only as minimum (will fill once cha62 arrives).");
+            var self = new List<TeammateConfig> { new() { Id = _myCharId, Type = 1, ArmoryId = -1 } };
+            SessionStats.SetTeam(new[] { new TeammateInfo(_myCharId, 1, 0, 0, 0) });
+            return self;
+        }
+
+        return cfg.Teammates; // charId unknown — should not happen after login
+    }
+
+    /// <summary>
+    /// Mirrors Character.getAutoAssignedTeam(teamRules, type) exactly.
+    /// Uses _pveTeamRules (populated from cha62) for slot count and toggle flags.
+    ///
+    ///  getTeammates(teamRules):
+    ///   1. If allowFriends: add all friends (cha13) — type 1, skip self.
+    ///   2. If allowGuildmates: add guildmates not already in list — type 1, skip self.
+    ///   3. If allowFamiliars: add owned familiars from inventory (cha16, ite1=6) — type 2, one per qty.
+    ///   4. Sort by totalCalculated (P+S+A) descending.
+    ///
+    ///  getAutoAssignedTeam():
+    ///   5. Re-sort by totalCalculated desc, staminaCalculated asc as tiebreaker.
+    ///   6. Insert self (type 1) at index 0.
+    ///   7. Split: players (type==1) and familiars (type!=1).
+    ///   8. Deduplicate players by charId (keep first = highest stats).
+    ///   9. Recombine: players first, then familiars.
+    ///  10. Truncate to teamRules.slots.
+    ///  11. If self was truncated out → replace last slot with self.
+    /// </summary>
+    static List<TeammateConfig> BuildAutoTeam()
+    {
+        // Use the slot count and toggle flags from the server's TeamRules —
+        // mirrors getAutoAssignedTeam's teamRules.slots / teamRules.allowFriends etc.
+        int  slots            = _pveTeamRules.Slots;
+        bool allowFriends     = _pveTeamRules.AllowFriends;
+        bool allowGuildmates  = _pveTeamRules.AllowGuildmates;
+        bool allowFamiliars   = _pveTeamRules.AllowFamiliars;
+
+        // ── Step 1-3: build combined roster (friends + guildmates + familiars) ──
+        var candidates = new List<(int Id, int Type, int Total, int Stamina)>();
+        var seenPlayers = new HashSet<int>();
+
+        if (allowFriends)
+        {
+            foreach (var f in _knownFriends)
+            {
+                if (f.CharId == _myCharId) continue;
+                if (seenPlayers.Add(f.CharId))
+                    candidates.Add((f.CharId, 1, f.Power + f.Stamina + f.Agility, f.Stamina));
+            }
+        }
+        if (allowGuildmates)
+        {
+            foreach (var g in _knownGuildmates)
+            {
+                if (g.CharId == _myCharId) continue;
+                if (seenPlayers.Add(g.CharId)) // skip if already added as friend
+                    candidates.Add((g.CharId, 1, g.Power + g.Stamina + g.Agility, g.Stamina));
+            }
+        }
+        if (allowFamiliars)
+        {
+            foreach (int famId in _ownedFamiliars)
+                candidates.Add((famId, 2, 0, 0)); // familiars: stat=0 (FamiliarBook not available)
+        }
+
+        // ── Step 4-5: sort by totalCalculated desc, staminaCalculated asc ──
+        candidates = candidates
+            .OrderByDescending(c => c.Total)
+            .ThenBy(c => c.Stamina)
+            .ToList();
+
+        // ── Step 6: insert self at position 0 ──
+        candidates.Insert(0, (_myCharId, 1, 0, 0));
+
+        // ── Step 7-8: separate players / familiars, deduplicate players by charId ──
+        var players   = candidates
+            .Where(c => c.Type == 1)
+            .GroupBy(c => c.Id)
+            .Select(g => g.First())
+            .ToList();
+        var familiars = candidates
+            .Where(c => c.Type != 1)
+            .ToList();
+
+        // ── Step 9: recombine players first, familiars after ──
+        var merged = players.Concat(familiars).ToList();
+
+        // ── Step 10: truncate to slot count ──
+        if (merged.Count > slots)
+            merged.RemoveRange(slots, merged.Count - slots);
+
+        // ── Step 11: guarantee self is present ──
+        if (_myCharId > 0 && !merged.Any(c => c.Id == _myCharId && c.Type == 1))
+        {
+            if (merged.Count > 0)
+                merged[merged.Count - 1] = (_myCharId, 1, 0, 0);
+            else
+                merged.Add((_myCharId, 1, 0, 0));
+        }
+
+        var result = merged.Select(c => new TeammateConfig { Id = c.Id, Type = c.Type, ArmoryId = -1 }).ToList();
+        Logger.Debug($"[TEAM] Auto-assign: {result.Count}/{slots} slots — " +
+                     $"[{string.Join(", ", result.Select(t => $"{(t.Type == 2 ? "fam" : "plr")}:{t.Id}"))}]");
+        return result;
+    }
+
+    // FriendDALC (dal0=3)
+    // The server pushes friend-list updates and online/offline notifications through this DALC.
+    static void HandleFriendDALC(SFSObject r, int act)
+    {
+        Logger.Debug($"[FRIEND] act0={act} keys: {string.Join(", ", r.GetKeys())}");
+        // Any FriendDALC packet may carry cha13 (full friend list refresh) or
+        // individual friend updates — scan for team data regardless of action.
+        ScanForTeamData(r);
+
+        // Handle individual friend online/offline status updates.
+        // The server sends the friend's char data with use5=true/false.
+        if (r.ContainsKey("cha1") && r.ContainsKey("use5"))
+        {
+            int  charId = r.GetInt("cha1");
+            bool online = r.GetBool("use5");
+            int  power   = r.ContainsKey("cha6") ? r.GetInt("cha6") : 0;
+            int  stamina = r.ContainsKey("cha7") ? r.GetInt("cha7") : 0;
+            int  agility = r.ContainsKey("cha8") ? r.GetInt("cha8") : 0;
+
+            // Update or insert the friend in _knownFriends
+            int idx = _knownFriends.FindIndex(f => f.CharId == charId);
+            var updated = new FriendInfo(charId,
+                power   > 0 ? power   : idx >= 0 ? _knownFriends[idx].Power   : 0,
+                stamina > 0 ? stamina : idx >= 0 ? _knownFriends[idx].Stamina : 0,
+                agility > 0 ? agility : idx >= 0 ? _knownFriends[idx].Agility : 0,
+                online);
+            if (idx >= 0) _knownFriends[idx] = updated;
+            else          _knownFriends.Add(updated);
+            Logger.Debug($"[FRIEND] id={charId} online={online} total={updated.Power+updated.Stamina+updated.Agility}");
+        }
+    }
+
+    /// <summary>
+    /// Scan a server response for cha13 (friends), gui5 (guildmates), and fam0 (familiars)
+    /// at the top level and inside act1/act2 nested objects. Updates the known-roster fields
+    /// whenever new data is found; existing data is preserved if the field is absent.
+    /// </summary>
+    static void ScanForTeamData(ISFSObject r)
+    {
+        // Debug: show which team-data keys are present in this packet.
+        bool hasC13 = r.ContainsKey("cha13");
+        bool hasC16 = r.ContainsKey("cha16");
+        bool hasC62 = r.ContainsKey("cha62");
+        bool hasGui5 = r.ContainsKey("gui5");
+        if (hasC13 || hasC16 || hasC62 || hasGui5)
+            Logger.Info($"[SCAN] Team-data keys found — cha13={hasC13} cha16={hasC16} cha62={hasC62} gui5={hasGui5}");
+        else
+            Logger.Debug("[SCAN] no team-data keys in this packet");
+
+        ParseFriends(r);
+        ParseGuildmates(r);
+        ParseInventoryFamiliars(r);
+        ParseAndStorePveTeam(r);
+
+        // act1: some server responses nest the full character object here
+        if (r.ContainsKey("act1")) try
+        {
+            var a = r.GetSFSObject("act1");
+            ParseFriends(a);
+            ParseGuildmates(a);
+            ParseInventoryFamiliars(a);
+            ParseAndStorePveTeam(a);
+        }
+        catch { }
+
+        // act2: SFSArray of objects (batch responses)
+        if (r.ContainsKey("act2")) try
+        {
+            var arr = r.GetSFSArray("act2");
+            for (int i = 0; i < arr.Size(); i++)
+            {
+                var obj = arr.GetSFSObject(i);
+                ParseFriends(obj);
+                ParseGuildmates(obj);
+                ParseInventoryFamiliars(obj);
+                ParseAndStorePveTeam(obj);
+            }
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// Parse friends list from cha13. Only replaces _knownFriends when the array is
+    /// non-empty — prevents wiping a populated list when cha13 is absent or empty.
+    /// </summary>
+    static void ParseFriends(ISFSObject r)
+    {
+        if (!r.ContainsKey("cha13")) return;
+        try
+        {
+            var arr  = r.GetSFSArray("cha13");
+            if (arr.Size() == 0) { Logger.Debug("[TEAM] cha13 present but empty."); return; }
+            var list = new List<FriendInfo>();
+            for (int i = 0; i < arr.Size(); i++)
+            {
+                var f      = arr.GetSFSObject(i);
+                int charId = f.ContainsKey("cha1") ? f.GetInt("cha1") : 0;
+                if (charId <= 0)
+                {
+                    Logger.Debug($"[TEAM] cha13[{i}] skipped — no cha1. keys: {string.Join(",", f.GetKeys())}");
+                    continue;
+                }
+                int  power   = f.ContainsKey("cha6") ? f.GetInt("cha6") : 0;
+                int  stamina = f.ContainsKey("cha7") ? f.GetInt("cha7") : 0;
+                int  agility = f.ContainsKey("cha8") ? f.GetInt("cha8") : 0;
+                bool online  = f.ContainsKey("use5") && f.GetBool("use5");
+                list.Add(new FriendInfo(charId, power, stamina, agility, online));
+            }
+            if (list.Count == 0) { Logger.Debug("[TEAM] cha13 had entries but all were skipped."); return; }
+            _knownFriends = list;
+            int onlineCnt = list.Count(f => f.Online);
+            Logger.Info($"[TEAM] {list.Count} friends loaded ({onlineCnt} online, sorted by P+S+A).");
+            foreach (var f in list.OrderByDescending(f => f.Power + f.Stamina + f.Agility))
+                Logger.Debug($"  [FRIEND] id={f.CharId} P={f.Power} S={f.Stamina} A={f.Agility} total={f.Power+f.Stamina+f.Agility} online={f.Online}");
+        }
+        catch (Exception ex) { Logger.Debug($"[TEAM] ParseFriends error: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Parse guild members from gui5. GuildMemberData.listFromSFSObject reads gui5 as an SFSArray
+    /// of CharacterData objects (same structure as cha13 friends). Only replaces _knownGuildmates
+    /// when non-empty — preserves existing data if gui5 is absent or empty in this packet.
+    /// </summary>
+    static void ParseGuildmates(ISFSObject r)
+    {
+        if (!r.ContainsKey("gui5")) return;
+        try
+        {
+            var arr  = r.GetSFSArray("gui5");
+            if (arr.Size() == 0) return;
+            var list = new List<FriendInfo>();
+            for (int i = 0; i < arr.Size(); i++)
+            {
+                var g      = arr.GetSFSObject(i);
+                int charId = g.ContainsKey("cha1") ? g.GetInt("cha1") : 0;
+                if (charId <= 0) continue;
+                int  power   = g.ContainsKey("cha6") ? g.GetInt("cha6") : 0;
+                int  stamina = g.ContainsKey("cha7") ? g.GetInt("cha7") : 0;
+                int  agility = g.ContainsKey("cha8") ? g.GetInt("cha8") : 0;
+                bool online  = g.ContainsKey("use5") && g.GetBool("use5");
+                list.Add(new FriendInfo(charId, power, stamina, agility, online));
+            }
+            if (list.Count == 0) return;
+            _knownGuildmates = list;
+            int onlineCnt = list.Count(g => g.Online);
+            Logger.Info($"[TEAM] {list.Count} guildmate(s) loaded ({onlineCnt} online).");
+            foreach (var g in list.OrderByDescending(g => g.Power + g.Stamina + g.Agility))
+                Logger.Debug($"  [GUILD] id={g.CharId} P={g.Power} S={g.Stamina} A={g.Agility} total={g.Power+g.Stamina+g.Agility} online={g.Online}");
+        }
+        catch (Exception ex) { Logger.Debug($"[TEAM] ParseGuildmates error: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Parse battle-companion familiars from cha16 (inventory), filtering by ite1=6 (ItemType = Familiar).
+    /// This matches Character.getTeammates() which calls _inventory.GetItemsByType(6).
+    /// Each familiar with qty>1 gets added once per copy (mirrors the while-loop in getTeammates).
+    /// fam0 is the familiar *stable* (stat bonuses for self) — not used for teammates.
+    /// </summary>
+    static void ParseInventoryFamiliars(ISFSObject r)
+    {
+        if (!r.ContainsKey("cha16")) return;
+        try
+        {
+            var arr = r.GetSFSArray("cha16");
+            if (arr.Size() == 0) { Logger.Debug("[TEAM] cha16 present but empty."); return; }
+            var list = new List<int>();
+            // Log the first few item types to help diagnose type mismatches
+            var typeSample = new System.Text.StringBuilder();
+            int sampleCount = Math.Min(arr.Size(), 10);
+            for (int s = 0; s < sampleCount; s++)
+            {
+                var si = arr.GetSFSObject(s);
+                int t = si.ContainsKey("ite1") ? si.GetInt("ite1") : -1;
+                typeSample.Append(t).Append(' ');
+            }
+            Logger.Info($"[TEAM] cha16 has {arr.Size()} item(s). First {sampleCount} ite1 types: {typeSample.ToString().Trim()}");
+            for (int i = 0; i < arr.Size(); i++)
+            {
+                var item = arr.GetSFSObject(i);
+                if (!item.ContainsKey("ite0") || !item.ContainsKey("ite1")) continue;
+                if (item.GetInt("ite1") != 6) continue; // 6 = familiar item type (confirmed by Character.getTeammates → GetItemsByType(6))
+                int famId = item.GetInt("ite0");
+                int qty   = item.ContainsKey("ite2") ? item.GetInt("ite2") : 1;
+                for (int q = 0; q < qty && famId > 0; q++)
+                    list.Add(famId);
+            }
+            if (list.Count == 0) { Logger.Debug("[TEAM] cha16 had items but none with ite1=6 (familiar)."); return; }
+            _ownedFamiliars = list;
+            Logger.Info($"[TEAM] {list.Count} familiar slot(s) from inventory (cha16).");
+        }
+        catch (Exception ex) { Logger.Debug($"[TEAM] ParseInventoryFamiliars error: {ex.Message}"); }
     }
 
     /// <summary>
@@ -2176,41 +2613,131 @@ public static class BHBot
     /// The <c>cha62</c> SFSArray holds all team types; we extract <c>team0=1</c> (TYPE_PVE).
     /// Teammate armoryId is always -1 — the server does not echo <c>tmts3</c> back.
     /// </summary>
+    /// <summary>
+    /// Parse the character's saved teams from cha62.
+    /// Mirrors Teams.fromSFSObject → TeamData.fromSFSObject → TeamRules.fromSFSObject.
+    /// Stores TeamRules (slot count + toggle flags) alongside the teammate list for TYPE_PVE (team0=1).
+    /// </summary>
     static void ParseAndStorePveTeam(ISFSObject r)
     {
         if (!r.ContainsKey("cha62")) return;
         try
         {
             var teams = r.GetSFSArray("cha62");
+
+            // cha62 holds MULTIPLE TYPE_PVE entries (one per lineup slot).
+            // Pick the one with the most slots (team1); break ties with the highest team7
+            // (server-assigned ID, increments on save → most recently configured entry).
+            ISFSObject? best = null;
+            int bestSlots = -1;
+            int bestId    = -1;
             for (int i = 0; i < teams.Size(); i++)
             {
-                var team = teams.GetSFSObject(i);
-                if (!team.ContainsKey("team0") || team.GetInt("team0") != 1) continue; // TYPE_PVE = 1
-                if (!team.ContainsKey("tmts0")) break;
-
-                var arr  = team.GetSFSArray("tmts0");
-                var list = new List<TeammateConfig>();
-                for (int j = 0; j < arr.Size(); j++)
+                var entry = teams.GetSFSObject(i);
+                if (!entry.ContainsKey("team0") || entry.GetInt("team0") != 1) continue; // TYPE_PVE = 1
+                int slots = entry.ContainsKey("team1") ? entry.GetInt("team1") : 0;
+                int id    = entry.ContainsKey("team7") ? entry.GetInt("team7") : 0;
+                if (slots > bestSlots || (slots == bestSlots && id > bestId))
                 {
-                    var tm = arr.GetSFSObject(j);
-                    list.Add(new TeammateConfig
-                    {
-                        Id       = tm.ContainsKey("tmts1") ? tm.GetInt("tmts1") : 0,
-                        Type     = tm.ContainsKey("tmts2") ? tm.GetInt("tmts2") : 1,
-                        ArmoryId = -1   // server never sends tmts3 back
-                    });
+                    best      = entry;
+                    bestSlots = slots;
+                    bestId    = id;
                 }
-                _savedTeammates = list;
-                Logger.Info($"[TEAM] PVE team loaded: {list.Count} teammate(s) — " +
-                            $"[{string.Join(", ", list.Select(t => $"id={t.Id} type={t.Type}"))}]");
+            }
+
+            if (best == null)
+            {
+                Logger.Info("[TEAM] cha62 present but no TYPE_PVE (team0=1) entry found. Teams: " +
+                    string.Join(", ", Enumerable.Range(0, teams.Size()).Select(i => {
+                        var t = teams.GetSFSObject(i);
+                        return t.ContainsKey("team0") ? t.GetInt("team0").ToString() : "?";
+                    })));
                 return;
             }
-            Logger.Debug("[TEAM] cha62 present but no PVE team (team0=1) found.");
+
+            // TeamRules.fromSFSObject: team1=slots, team6=size, team2-5/8=toggle flags.
+            if (best.ContainsKey("team1"))
+            {
+                _pveTeamRules = new PveTeamRules(
+                    Slots:               best.GetInt("team1"),
+                    Size:                best.ContainsKey("team6") ? best.GetInt("team6") : best.GetInt("team1"),
+                    AllowFamiliars:      !best.ContainsKey("team2") || best.GetBool("team2"),
+                    AllowFriends:        !best.ContainsKey("team3") || best.GetBool("team3"),
+                    AllowGuildmates:     !best.ContainsKey("team4") || best.GetBool("team4"),
+                    StatBalance:         best.ContainsKey("team5") && best.GetBool("team5"),
+                    AllowPlayerMultiHero:best.ContainsKey("team8") && best.GetBool("team8"));
+            }
+
+            if (!best.ContainsKey("tmts0"))
+            {
+                Logger.Debug("[TEAM] Best PVE entry has no tmts0 — TeamRules updated, no saved teammates.");
+                return;
+            }
+
+            var arr  = best.GetSFSArray("tmts0");
+            var list = new List<TeammateConfig>();
+            for (int j = 0; j < arr.Size(); j++)
+            {
+                var tm = arr.GetSFSObject(j);
+                list.Add(new TeammateConfig
+                {
+                    Id       = tm.ContainsKey("tmts1") ? tm.GetInt("tmts1") : 0,
+                    Type     = tm.ContainsKey("tmts2") ? tm.GetInt("tmts2") : 1,
+                    ArmoryId = -1
+                });
+            }
+            _savedTeammates = list;
+            Logger.Info($"[TEAM] PVE team loaded (team7={bestId}): {list.Count} teammate(s), slots={_pveTeamRules.Slots} " +
+                        $"(allowFriends={_pveTeamRules.AllowFriends} allowFamiliars={_pveTeamRules.AllowFamiliars} allowGuildmates={_pveTeamRules.AllowGuildmates}) — " +
+                        $"[{string.Join(", ", list.Select(t => $"id={t.Id} type={t.Type}"))}]");
         }
         catch (Exception ex)
         {
             Logger.Debug($"[TEAM] Failed to parse cha62: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Parse the SAVE_TEAM (CharacterDALC act0=12) server response.
+    /// Mirrors Project.OnSaveTeam: the server echoes back team0 (type) and tmts0
+    /// (SFSArray of {tmts1:id, tmts2:type}). Only stores the TYPE_PVE (team0=1) team.
+    /// This is the format TeamWindow sends/receives when the user saves their lineup.
+    /// </summary>
+    static void ParseSaveTeamResponse(ISFSObject r)
+    {
+        try
+        {
+            if (!r.ContainsKey("team0") || !r.ContainsKey("tmts0")) return;
+            if (r.GetInt("team0") != 1) return; // only TYPE_PVE = 1
+
+            // Also update TeamRules if the server echoes them back (team1/team6/team2-5/8).
+            if (r.ContainsKey("team1"))
+            {
+                _pveTeamRules = new PveTeamRules(
+                    Slots:               r.GetInt("team1"),
+                    Size:                r.ContainsKey("team6") ? r.GetInt("team6") : r.GetInt("team1"),
+                    AllowFamiliars:      !r.ContainsKey("team2") || r.GetBool("team2"),
+                    AllowFriends:        !r.ContainsKey("team3") || r.GetBool("team3"),
+                    AllowGuildmates:     !r.ContainsKey("team4") || r.GetBool("team4"),
+                    StatBalance:         r.ContainsKey("team5") && r.GetBool("team5"),
+                    AllowPlayerMultiHero:r.ContainsKey("team8") && r.GetBool("team8"));
+            }
+
+            var tmts = r.GetSFSArray("tmts0");
+            var list = new List<TeammateConfig>();
+            for (int i = 0; i < tmts.Size(); i++)
+            {
+                var obj  = tmts.GetSFSObject(i);
+                int id   = obj.ContainsKey("tmts1") ? obj.GetInt("tmts1") : 0;
+                int type = obj.ContainsKey("tmts2") ? obj.GetInt("tmts2") : 1;
+                if (id > 0) list.Add(new TeammateConfig { Id = id, Type = type, ArmoryId = -1 });
+            }
+            if (list.Count == 0) return;
+            _savedTeammates = list;
+            Logger.Info($"[TEAM] PVE team updated from SAVE_TEAM: {list.Count} teammate(s), slots={_pveTeamRules.Slots} — " +
+                        $"[{string.Join(", ", list.Select(t => $"id={t.Id} type={t.Type}"))}]");
+        }
+        catch (Exception ex) { Logger.Debug($"[TEAM] ParseSaveTeamResponse error: {ex.Message}"); }
     }
 
     /// <summary>
@@ -2220,6 +2747,7 @@ public static class BHBot
     /// </summary>
     static void SerialiseTeammates(SFSObject p, List<TeammateConfig> teammates)
     {
+        // Always write tmts0 — mirrors TeammateData.listToSFSObject which always adds the array.
         var arr = new SFSArray();
         foreach (var t in teammates)
         {
@@ -2342,6 +2870,8 @@ public static class BHBot
         if (r.ContainsKey("cha27"))  SessionStats.UpdateCurrency(energy:  r.GetInt("cha27"));
         if (r.ContainsKey("cha29"))  SessionStats.UpdateCurrency(tickets: r.GetInt("cha29"));
         if (r.ContainsKey("cha67"))  SessionStats.UpdateCurrency(shards:  r.GetInt("cha67"));
+        if (r.ContainsKey("cha5"))   SessionStats.UpdateExpAndLevel(exp:   r.GetLong("cha5"));
+        if (r.ContainsKey("cha4"))   SessionStats.UpdateExpAndLevel(level: r.GetInt("cha4"));
         if (r.ContainsKey("cha28") && r.ContainsKey("cha97"))
             SessionStats.UpdateEnergyRegen(r.GetLong("cha28"), r.GetLong("cha97"));
         if (r.ContainsKey("cha30") && r.ContainsKey("cha98"))

@@ -3,29 +3,33 @@ using BitHeroesClient.Config;
 using BitHeroesClient.Gui;
 using BitHeroesClient.Logging;
 
-// ── Configuration ──────────────────────────────────────────────────────────────
+internal static class Program
+{
+    [STAThread]
+    static void Main()
+    {
+        // ── Configuration ────────────────────────────────────────────────────────
 
-AppConfig config = ConfigLoader.Load("config.json");
+        AppConfig config = ConfigLoader.Load("config.json");
 
-Logger.Configure(
-    logToFile:   config.Logging.LogToFile,
-    logFilePath: config.Logging.LogFile,
-    verboseMode: config.Logging.VerboseMode,
-    bufferLines: 500);
+        Logger.Configure(
+            logToFile:   config.Logging.LogToFile,
+            logFilePath: config.Logging.LogFile,
+            verboseMode: config.Logging.VerboseMode,
+            bufferLines: 500);
 
-AppDomain.CurrentDomain.ProcessExit += (_, _) => Logger.Shutdown();
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => Logger.Shutdown();
 
-// ── WinForms bootstrap ─────────────────────────────────────────────────────────
+        // ── WinForms bootstrap ───────────────────────────────────────────────────
 
-Application.EnableVisualStyles();
-Application.SetCompatibleTextRenderingDefault(false);
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
 
-// Catch unhandled exceptions on the UI thread so they are logged rather than silently
-// crashing the process. AccessViolationException from native code is not catchable in
-// .NET 5+, but all managed exceptions (InvalidOperation, ObjectDisposed, etc.) are.
-Application.ThreadException += (_, e) =>
-    Logger.Error($"[UI] Unhandled: {e.Exception.GetType().Name}: {e.Exception.Message}");
+        Application.ThreadException += (_, e) =>
+            Logger.Error($"[UI] Unhandled: {e.Exception.GetType().Name}: {e.Exception.Message}");
 
-Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
 
-Application.Run(new MainForm(config));
+        Application.Run(new MainForm(config));
+    }
+}
