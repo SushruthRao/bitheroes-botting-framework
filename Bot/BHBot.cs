@@ -131,6 +131,10 @@ public static class BHBot
     // Tutorial / account flags received from the server on login
     static bool _inTutorial = false;
 
+    // Character ID assigned by the server on login (cha1). Used to distinguish
+    // DungeonExtension act0=1 packets for our own character vs other players.
+    static int _myCharId = -1;
+
     // PVE team auto-detected from server's cha62 character data.
     // Used when DungeonConfig.Teammates is empty (the default).
     static List<TeammateConfig> _savedTeammates = new();
@@ -155,6 +159,13 @@ public static class BHBot
     static int  _navTargetRow = -1;   // current DoObjectActivate destination
     static int  _navTargetCol = -1;
 
+    // True after SendDungeonActivate() fires until ENTER_BATTLE arrives for that activation.
+    // Guards against double-activation from both OBJECT_REMOVE and ITEMS_ADDED firing back-to-back.
+    static bool _pendingActivation = false;
+
+    // True after all dungeon objects are defeated and we are waiting for DUNGEON_COMPLETE.
+    // Suppresses the WaitingForBattle stall-timeout so it doesn't fire a spurious RESULTS.
+    static bool _awaitingDungeonComplete = false;
 
     // dun28/dun32 are bool in the SFS2X packet.
     static List<DungeonObjectInfo> _dungeonObjects = new();
@@ -412,7 +423,7 @@ public static class BHBot
         AssertInGame();
         var p = Packet(DALC_BATTLE, 5);
         p.PutBool("bat57", useDamageGain);
-        SendDungeon(p);
+        Send(p);
         Logger.Info($"[>] BattleDALC AUTO damageGain={useDamageGain}");
         SessionStats.SetState("AutoBattleActive", $"AUTO sent (dmgGain={useDamageGain})");
     }
@@ -425,7 +436,7 @@ public static class BHBot
     public static void SendBattleResults()
     {
         AssertInGame();
-        SendDungeon(Packet(DALC_BATTLE, 4));
+        Send(Packet(DALC_BATTLE, 4));
         Logger.Info("[>] BattleDALC RESULTS");
         SessionStats.SetState("WaitingForResults", "RESULTS sent");
     }
@@ -437,7 +448,7 @@ public static class BHBot
     public static void QuitBattle()
     {
         AssertInGame();
-        SendDungeon(Packet(DALC_BATTLE, 7));
+        Send(Packet(DALC_BATTLE, 7));
         Logger.Info("[>] BattleDALC QUIT");
     }
 
@@ -450,7 +461,7 @@ public static class BHBot
         AssertInGame();
         var p = Packet(DALC_BATTLE, 9);
         p.PutInt("bat7", entityIndex);
-        SendDungeon(p);
+        Send(p);
         Logger.Info($"[>] BattleDALC CAPTURE_DECLINE entity={entityIndex}");
     }
 
@@ -466,7 +477,7 @@ public static class BHBot
         p.PutInt("ite0",  serviceItemId);
         p.PutInt("curr0", currencyId);
         p.PutInt("curr2", currencyCost);
-        SendDungeon(p);
+        Send(p);
         Logger.Info($"[>] BattleDALC CAPTURE_ACCEPT entity={entityIndex}");
     }
 
@@ -667,6 +678,12 @@ public static class BHBot
                 {
                     Logger.Debug($"[DUNGEON-EXT] act0={act} keys: {string.Join(", ", resp.GetKeys())}");
                     HandleDungeonExtension(resp, act);
+                }
+                else if (cmd == "InstanceExtension" && act != -1)
+                {
+                    // InstanceExtension handles player movement, presence, and fishing in instance rooms.
+                    // These are separate from dungeon combat — no action needed here.
+                    Logger.Debug($"[INST-EXT] act0={act} keys: {string.Join(", ", resp.GetKeys())}");
                 }
                 else
                 {
@@ -874,10 +891,17 @@ public static class BHBot
                     SavePlayerId(_playerId);
                 }
                 if (r.ContainsKey("cha1"))
-                    Logger.Info($"[LOGIN] charID={r.GetInt("cha1")}");
+                {
+                    _myCharId = r.GetInt("cha1");
+                    Logger.Info($"[LOGIN] charID={_myCharId}");
+                }
                 if (r.ContainsKey("act1")) try {
                     var a = r.GetSFSObject("act1");
-                    if (a.ContainsKey("cha1")) Logger.Info($"[LOGIN] charID(act1)={a.GetInt("cha1")}");
+                    if (a.ContainsKey("cha1"))
+                    {
+                        _myCharId = a.GetInt("cha1");
+                        Logger.Info($"[LOGIN] charID(act1)={_myCharId}");
+                    }
                 } catch { }
 
                 if (r.ContainsKey("cha11"))
@@ -944,52 +968,49 @@ public static class BHBot
         {
             case 0: // ENTER_BATTLE — server is starting a new battle wave
                 _lastBattleEvent = DateTime.UtcNow;
-                Logger.Info($"[DUNGEON] Wave {_waveCount + 1} starting");
-                SessionStats.SetWave(_waveCount + 1);
+                Logger.Info("[DUNGEON] ENTER_BATTLE received");
                 OnEnterBattle(r);
                 break;
 
-            case 1: // ENTER_DUNGEON — dungeon session is fully active
-                Logger.Info("[DUNGEON] ENTER_DUNGEON received — session active");
-                Logger.Info($"[DUNGEON] act0=1 keys: {string.Join(", ", r.GetKeys())}");
+            case 1: // ENTER_DUNGEON  — server→client dungeon session active (zone dungeon)
+            case 2: // ENTER_INSTANCE — server→client dungeon session active (instance dungeon, room name "I:NNN")
+            {
+                string label = act == 1 ? "ENTER_DUNGEON" : "ENTER_INSTANCE";
+                Logger.Info($"[DUNGEON] {label} received — session active");
 
-                // If roo1 is present, grab the room reference now (server may have force-joined us already)
-                if (r.ContainsKey("roo1") && _dungeonRoom == null)
+                // Update the dungeon room reference (may already be set from ROOM_JOIN).
+                if (r.ContainsKey("roo1"))
                 {
                     int rid = r.GetInt("roo1");
-                    string rname = r.ContainsKey("roo0") ? r.GetUtfString("roo0") : "?";
-                    Logger.Info($"[DUNGEON] roo1 in ENTER_DUNGEON: id={rid} name={rname}");
-                    _dungeonRoom = _sfs!.GetRoomById(rid);
-                    if (_dungeonRoom == null)
-                        Logger.Warn($"[DUNGEON] GetRoomById({rid}) returned null — dungeon packets will use ServerExtension fallback");
-                    else
-                        Logger.Info($"[DUNGEON] Dungeon room reference acquired: {_dungeonRoom.Name}");
+                    var newRoom = _sfs!.GetRoomById(rid);
+                    if (newRoom != null && (_dungeonRoom == null || _dungeonRoom.Id != rid))
+                    {
+                        _dungeonRoom = newRoom;
+                        Logger.Info($"[DUNGEON] Room updated: {_dungeonRoom.Name}");
+                    }
                 }
 
-                // Parse the dungeon grid so we know where to navigate.
-                ParseDungeonState(r);
-
-                // Log extra ENTER_DUNGEON fields — dun11/dun12 are plain ints here (NOT arrays)
-                try {
-                    if (r.ContainsKey("dun11")) Logger.Info($"[DUNGEON] dun11(int)={r.GetInt("dun11")}");
-                    if (r.ContainsKey("dun12")) Logger.Info($"[DUNGEON] dun12(int)={r.GetInt("dun12")}");
-                    if (r.ContainsKey("dun15")) Logger.Info($"[DUNGEON] dun15(int)={r.GetInt("dun15")}");
-                    if (r.ContainsKey("dun16")) Logger.Info($"[DUNGEON] dun16(int)={r.GetInt("dun16")}");
-                } catch (Exception ex) { Logger.Debug($"[DUNGEON] extra field log err: {ex.Message}"); }
-
-                // CharacterDALC act0=6 — disabled for debugging (suspected kick trigger)
-                // SendCharacterStateConfirmation();
+                // Parse the dungeon grid from this packet.
+                // ENTER_DUNGEON (act0=1) carries the full dun0 array for a zone-based dungeon.
+                // Always do a clean parse here — this is the authoritative initial state.
+                ParseDungeonState(r, clearFirst: true);
 
                 // Notify GUI with parsed object list
                 OnDungeonLoaded?.Invoke(_dungeonObjects.AsReadOnly());
 
                 _auto = AutoState.WaitingForBattle;
                 _lastBattleEvent = DateTime.UtcNow;
-                SessionStats.SetState("WaitingForBattle", "Dungeon ready — activating in 800ms");
-                // Server may embed an immediate first wave in the same packet
+                SessionStats.SetState("WaitingForBattle", "Dungeon active — activating first enemy");
+
+                // Server may embed an immediate first wave in the ENTER_DUNGEON packet (rare).
+                // Otherwise activate the first enemy now — this is what CheckAutoPilot() does in
+                // the real client immediately after the dungeon finishes loading.
                 if (r.ContainsKey("bat0"))
                     OnEnterBattle(r);
+                else
+                    SendDungeonActivate();
                 break;
+            }
 
             case 3: // NOTIFICATION
                 string note = r.ContainsKey("not1") ? r.GetUtfString("not1") : "(empty)";
@@ -1119,51 +1140,172 @@ public static class BHBot
     {
         switch (act)
         {
-            case 1: // QUEUE — server→client battle ready/queue notification (observed in some modes)
-                Logger.Debug("[BATTLE] QUEUE notification received.");
-                break;
+            case 1:
+            {
+                // QUEUE — server packs battle animation events into bat3 SFSArray.
+                // bat3 event act0 values (from Battle.cs RunQueue switch):
+                //   0x01 = DoActionDelay            0x07 = DoActionTurnStart ← our turn
+                //   0x02 = DoActionHealthChange      0x08 = DoActionTurnEnd
+                //   0x03 = DoActionMeterChange       0x09 = DoActionDeathChange
+                //   0x04 = DoActionMeterGain         0x0A = DoActionComplete  ← round done
+                //   0x05 = DoActionBegin             0x0B = DoActionVictory   ← encounter won
+                //   0x06 = DoActionAbility           0x0C = DoActionDefeat    ← encounter lost
+                //   0x0F = DoActionCaptureSet        ← familiar capture prompt (bat7=entityIdx)
+                //   0x15 = DoActionResults           ← dungeon combined result (bat47=win)
+                //
+                // Per-round flow: send AUTO → server processes round → QUEUE arrives.
+                // If QUEUE has no 0xA/0xB/0xC/0x15 → more rounds remain → send AUTO again.
+                // If 0xA only (Complete) → all rounds done, send RESULTS to collect loot.
+                //   Server may then send ENTER_BATTLE (next wave of multi-wave encounter)
+                //   or QUEUE [0xB/0x15] (encounter fully over).
+                // If 0xB/0xC/0x15 → encounter fully resolved; DungeonExtension follows with
+                //   OBJECT_REMOVE then ITEMS_ADDED → we activate the next enemy.
+                // If 0x0F (CaptureSet) → auto-decline the familiar capture, then continue.
+                _lastBattleEvent = DateTime.UtcNow;
 
-            case 5: // AUTO — server finished one battle wave
-                _waveCount++;
+                bool hasComplete   = false;
+                bool hasVictory    = false;
+                bool hasDefeat     = false;
+                bool hasResults    = false;
+                bool resultsIsWin  = false;  // bat47 value inside 0x15 event
+                int  captureEntity = -1;     // bat7 from 0x0F CaptureSet event
+
+                if (r.ContainsKey("bat3"))
+                {
+                    try
+                    {
+                        var events = r.GetSFSArray("bat3");
+                        Logger.Debug($"[BATTLE] QUEUE bat3 has {events.Size()} event(s).");
+                        for (int i = 0; i < events.Size(); i++)
+                        {
+                            var ev    = events.GetSFSObject(i);
+                            int evAct = ev.ContainsKey("act0") ? ev.GetInt("act0") : -1;
+                            Logger.Debug($"[BATTLE]   bat3[{i}] act0=0x{evAct:X}");
+                            switch (evAct)
+                            {
+                                case 0xA:  hasComplete  = true; break;
+                                case 0xB:  hasVictory   = true; break;
+                                case 0xC:  hasDefeat    = true; break;
+                                case 0xF:  // DoActionCaptureSet — familiar capture prompt
+                                    captureEntity = ev.ContainsKey("bat7") ? ev.GetInt("bat7") : 0;
+                                    break;
+                                case 0x15: // DoActionResults — dungeon combined result
+                                    hasResults   = true;
+                                    resultsIsWin = ev.ContainsKey("bat47") && ev.GetBool("bat47");
+                                    break;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Debug($"[BATTLE] bat3 parse error: {ex.Message}");
+                    }
+                }
+                else
+                {
+                    Logger.Debug("[BATTLE] QUEUE: no bat3 array.");
+                }
+
+                // Priority: terminal events > capture prompt > round continuation.
+                if (hasVictory || hasDefeat || hasResults)
+                {
+                    // Real client flow after each individual encounter:
+                    //   Victory (0x0B/0x15-win): CheckAutoPilot → DoObjectActivate for next enemy.
+                    //     The server sends OBJECT_REMOVE only when it processes the next DoObjectActivate,
+                    //     NOT automatically. Bot must send DoObjectActivate immediately to unblock server.
+                    //   Defeat (0x0C/0x15-loss): server broadcasts DungeonExtension PLAYER_DEFEAT (act0=2)
+                    //     → our case-2 handler sends DoPlayerExit.
+                    // DoPlayerExit is ONLY sent at dungeon end (DUNGEON_COMPLETE) or on defeat.
+                    bool win = hasVictory || (hasResults && resultsIsWin);
+                    string tag = hasVictory ? "0x0B" : hasResults ? "0x15" : "0x0C";
+                    _auto = AutoState.WaitingForBattle;
+                    _lastBattleEvent = DateTime.UtcNow;
+                    if (win)
+                    {
+                        // Real client: onCompleteBattleTransitionComplete → CheckAutoPilot → DoObjectActivate.
+                        // The server sends OBJECT_REMOVE only AFTER it receives the next DoObjectActivate,
+                        // not automatically after battle end. Send activate immediately to unblock the server.
+                        Logger.Info($"[BATTLE] Encounter WON ({tag}) — sending DoObjectActivate for next enemy.");
+                        SendDungeonActivate();
+                    }
+                    else
+                    {
+                        // Defeat: wait for DungeonExtension PLAYER_DEFEAT broadcast (act0=2).
+                        // Our case-2 handler will call SendPlayerExit from there.
+                        Logger.Info($"[BATTLE] Encounter LOST ({tag}) — awaiting PLAYER_DEFEAT broadcast.");
+                    }
+                }
+                else if (hasComplete)
+                {
+                    // 0xA: DoActionComplete — no more turns this round; no victory yet.
+                    // Real client: when _completed=true and _results=false → calls doResults().
+                    // This finalises the round; server may respond with ENTER_BATTLE (next wave)
+                    // or QUEUE [0x15] (encounter done).
+                    Logger.Info("[BATTLE] Round complete (0xA) — sending RESULTS.");
+                    _auto = AutoState.WaitingForResults;
+                    SendBattleResults();
+                }
+                else if (captureEntity >= 0 && _config.Automation.AutoDeclineCaptures)
+                {
+                    // 0x0F: CaptureSet — server paused battle for familiar capture prompt.
+                    // Decline immediately; server will send another QUEUE to resume combat.
+                    Logger.Info($"[BATTLE] CaptureSet (0x0F) — auto-declining entity {captureEntity}.");
+                    DeclineCapture(captureEntity);
+                    _auto = AutoState.AutoBattleActive;
+                }
+                else
+                {
+                    // No terminal event and no capture — battle ongoing (multi-round AUTO).
+                    // 0x07 (DoActionTurnStart) signals it is the player's turn.
+                    // Send AUTO; server processes the round and replies with another QUEUE.
+                    int battleNum = _waveCount;
+                    Logger.Info($"[BATTLE] Round ongoing — sending AUTO (battle {battleNum}).");
+                    _auto = AutoState.AutoBattleActive;
+                    SessionStats.SetState("AutoBattleActive", $"AUTO (battle {battleNum})");
+                    SendBattleAuto(GetCurrentDungeon().UseDamageGain);
+                }
+                break;
+            }
+
+            case 4:
+            {
+                // RESULTS response — server acknowledged our doResults() call.
+                // Server will now send OBJECT_REMOVE + ITEMS_ADDED (if it hasn't already)
+                // or another QUEUE with 0x15 (DoActionResults).
+                Logger.Info("[DUNGEON] RESULTS ack (act0=4) received.");
+                _lastBattleEvent = DateTime.UtcNow;
+                TryParseCurrency(r);
+                if (r.ContainsKey("bat47"))
+                    Logger.Info($"[DUNGEON]   bat47={r.GetBool("bat47")}");
+                _auto = AutoState.WaitingForBattle;
+                // Recovery: if OBJECT_REMOVE already arrived while we were in WaitingForResults
+                // (and was skipped by the old state check — now fixed), try activating now.
+                // SendDungeonActivate() is a no-op if _pendingActivation is already true or
+                // if there are no remaining enemies.
+                if (!_pendingActivation)
+                    SendDungeonActivate();
+                break;
+            }
+
+            case 5:
+            {
+                // AUTO echo — server may echo this in some non-dungeon battle modes.
+                // In dungeon mode this is rare; log and wait.
                 _lastBattleEvent = DateTime.UtcNow;
                 bool waveVictory = r.ContainsKey("bat47") && r.GetBool("bat47");
-                Logger.Info($"[BATTLE] Wave {_waveCount} done – victory={waveVictory}");
-                SessionStats.SetWave(_waveCount);
-                SessionStats.SetState("WaitingForBattle", $"Wave {_waveCount} complete");
+                Logger.Info($"[BATTLE] AUTO result (act0=5) — victory={waveVictory}");
+                SessionStats.SetState("WaitingForBattle", "AUTO result received");
 
-                // Capture prompt embedded in wave result
                 if (_config.Automation.AutoDeclineCaptures &&
                     r.ContainsKey("bat33") && r.GetBool("bat33"))
                 {
                     int eIdx = r.ContainsKey("bat7") ? r.GetInt("bat7") : 0;
                     Logger.Info($"[BATTLE] Auto-declining capture (entity {eIdx})");
                     DeclineCapture(eIdx);
-                    _auto = AutoState.WaitingForBattle;
-                    break;
                 }
-
                 _auto = AutoState.WaitingForBattle;
                 break;
-
-            case 4: // RESULTS — one battle room complete; may be mid-dungeon or final
-                Logger.Info("[DUNGEON] Battle RESULTS received.");
-                var result = ParseDungeonResult(r);
-                LogDungeonResult(result);
-                TryParseCurrency(r);
-
-                // Mark the room we just fought as used so autopilot picks the next one.
-                if (_navTargetRow >= 0)
-                {
-                    MarkDungeonObjectUsed(_navTargetRow, _navTargetCol);
-                    _navTargetRow = -1; _navTargetCol = -1;
-                }
-
-                _runCount++;
-                SessionStats.RecordRun(result);
-                OnDungeonComplete?.Invoke(result);
-                ResetDungeonState();
-                ScheduleNextRun();
-                break;
+            }
 
             case 7: // QUIT acknowledged
                 Logger.Info("[BATTLE] Quit acknowledged.");
@@ -1174,12 +1316,10 @@ public static class BHBot
 
             case 8: // CAPTURE_ACCEPT response
                 Logger.Debug("[BATTLE] Capture accepted.");
-                _auto = AutoState.WaitingForBattle;
                 break;
 
-            case 9: // CAPTURE_DECLINE response
+            case 9: // CAPTURE_DECLINE response — server will send QUEUE again for our turn
                 Logger.Debug("[BATTLE] Capture declined.");
-                _auto = AutoState.WaitingForBattle;
                 break;
 
             default:
@@ -1220,31 +1360,94 @@ public static class BHBot
     {
         switch (act)
         {
-            case 1: // PLAYER_EXIT — a player left the dungeon room (dun8 = their character ID)
-            {
+            case 1: // PLAYER_EXIT broadcast — server echoes act0=1 to all room members after a
+            {       // player exits a battle and returns to dungeon navigation.
+                    // Real client OnPlayerExit(): if dun8 == our charId → fire _dungeon.COMPLETE
+                    //   which (in auto-pilot mode) calls CheckAutoPilot() for the next object.
                 int charId = r.ContainsKey("dun8") ? r.GetInt("dun8") : -1;
-                Logger.Debug($"[DUNGEON-EXT] PLAYER_EXIT dun8={charId}");
+                // isOurs: true when dun8 matches our char ID, OR when dun8 is absent / we don't
+                // know our char ID yet (solo dungeon — the broadcast must be ours).
+                bool isOurs = charId == -1
+                              || _myCharId <= 0
+                              || charId == _myCharId;
+                Logger.Debug($"[DUNGEON-EXT] PLAYER_EXIT_BROADCAST dun8={charId} ours={isOurs}");
+                if (isOurs && _auto != AutoState.AutoBattleActive && !_pendingActivation)
+                {
+                    // Our character has returned to dungeon navigation — trigger the next enemy.
+                    // This is the equivalent of _dungeon.COMPLETE → CheckAutoPilot() in the real client.
+                    Logger.Debug("[DUNGEON-EXT] Our PLAYER_EXIT confirmed — calling SendDungeonActivate.");
+                    SendDungeonActivate();
+                }
                 break;
             }
 
-            case 2: // PLAYER_DEFEAT — a player was defeated (dun8 = their character ID)
-            {
+            case 2: // PLAYER_DEFEAT — server broadcast: a player was defeated (dun8 = their character ID)
+            {   // Real client DungeonExtension.OnPlayerDefeat(): if dun8==ourCharId → DoPlayerExit().
+                // DoPlayerExit formally ends the dungeon session on defeat.
                 int charId = r.ContainsKey("dun8") ? r.GetInt("dun8") : -1;
-                Logger.Debug($"[DUNGEON-EXT] PLAYER_DEFEAT dun8={charId}");
+                bool isOurs = charId == -1 || _myCharId <= 0 || charId == _myCharId;
+                Logger.Info($"[DUNGEON-EXT] PLAYER_DEFEAT dun8={charId} ours={isOurs}");
+                if (isOurs)
+                {
+                    Logger.Info("[DUNGEON-EXT] Our character was defeated — sending PLAYER_EXIT.");
+                    _auto = AutoState.WaitingForBattle;
+                    SendPlayerExit();
+                }
                 break;
             }
 
-            case 3: // OBJECT_ADD — server added an object to the grid
-                Logger.Debug("[DUNGEON-EXT] OBJECT_ADD");
+            case 3: // OBJECT_ADD — server dynamically added object(s) to the dungeon grid.
+            {       // Real client OnObjectAdd(): parses dun0 array → adds to grid → calls CheckAutoPilot.
+                    // This arrives for dungeons whose ENTER_INSTANCE carried an empty/partial dun0.
                 TryParseCurrency(r);
+                if (r.ContainsKey("dun0"))
+                {
+                    try
+                    {
+                        var added = r.GetSFSArray("dun0");
+                        for (int i = 0; i < added.Size(); i++)
+                        {
+                            var o     = added.GetSFSObject(i);
+                            int oRow  = o.ContainsKey("dun1")  ? o.GetInt("dun1")  : 0;
+                            int oCol  = o.ContainsKey("dun2")  ? o.GetInt("dun2")  : 0;
+                            int oType = o.ContainsKey("dun14") ? o.GetInt("dun14") : 0;
+                            bool oUsed = o.ContainsKey("dun32") && o.GetBool("dun32");
+                            bool oEmp  = o.ContainsKey("dun28") && o.GetBool("dun28");
+                            Logger.Debug($"[DUNGEON-EXT] OBJECT_ADD ({oRow},{oCol}) type={oType} used={oUsed} empty={oEmp}");
+                            // Replace existing entry for the same cell, or append.
+                            int idx = _dungeonObjects.FindIndex(x => x.Row == oRow && x.Col == oCol);
+                            var info = new DungeonObjectInfo(oRow, oCol, oType, oUsed, oEmp);
+                            if (idx >= 0) _dungeonObjects[idx] = info;
+                            else          _dungeonObjects.Add(info);
+                        }
+                        Logger.Debug($"[DUNGEON-EXT] After OBJECT_ADD: {_dungeonObjects.Count} total objects");
+                    }
+                    catch (Exception ex) { Logger.Debug($"[DUNGEON-EXT] OBJECT_ADD parse error: {ex.Message}"); }
+                }
+                // Mirror CheckAutoPilot(): always attempt activation after objects are added.
+                if (_auto != AutoState.AutoBattleActive && !_pendingActivation)
+                    SendDungeonActivate();
                 break;
+            }
 
             case 4: // OBJECT_REMOVE — object destroyed/looted; mark as used in our grid
             {
-                int row = r.ContainsKey("dun1") ? r.GetInt("dun1") : -1;
-                int col = r.ContainsKey("dun2") ? r.GetInt("dun2") : -1;
+                int  row       = r.ContainsKey("dun1")  ? r.GetInt("dun1")  : -1;
+                int  col       = r.ContainsKey("dun2")  ? r.GetInt("dun2")  : -1;
+                // dun32 semantics (from DungeonExtension.OnObjectRemove decompile):
+                //   dun32=FALSE → enemy/boss removed → CheckAutoPilot() IS called immediately
+                //   dun32=TRUE  → treasure/shrine removed (plays sound) → CheckAutoPilot NOT called
+                //                 (OnItemsAdded opens loot window → OnItemWindowClosed → CheckAutoPilot)
+                bool isLootObj = r.ContainsKey("dun32") && r.GetBool("dun32");
                 if (row >= 0) MarkDungeonObjectUsed(row, col);
-                Logger.Debug($"[DUNGEON-EXT] OBJECT_REMOVE ({row},{col})");
+                Logger.Debug($"[DUNGEON-EXT] OBJECT_REMOVE ({row},{col}) isLootObj={isLootObj}");
+                // Mirror CheckAutoPilot() exactly: the real client has NO state check here —
+                // it only checks extension.waiting (= _pendingActivation) and autoPilot=true.
+                // Do NOT gate on _auto: OBJECT_REMOVE can arrive while _auto=WaitingForResults
+                // (server sends OBJECT_REMOVE before the BattleDALC RESULTS ack), and we must
+                // not miss it. Only skip if currently mid-fight or already activating.
+                if (!isLootObj && _auto != AutoState.AutoBattleActive && !_pendingActivation)
+                    SendDungeonActivate();
                 break;
             }
 
@@ -1257,15 +1460,22 @@ public static class BHBot
                 Logger.Debug($"[DUNGEON-EXT] ENTITY act0={act}");
                 break;
 
-            case 9: // DUNGEON_COMPLETE — server confirms the whole dungeon is done.
-                // If we haven't already ended the run via RESULTS (e.g. no RESULTS ever fired),
-                // finish the run here. Otherwise just clean up.
+            case 9: // DUNGEON_COMPLETE — server confirms all enemies in the dungeon are defeated.
+                // Real client: CheckAutoPilot() finds IsCleared() → ShowCleared() → ShowDungeonCompleteWindow()
+                //   → user/autopilot clicks OK → DoPlayerExit() (DungeonExtension act0=1).
+                // Bot: we receive DUNGEON_COMPLETE, record the run, then send PLAYER_EXIT to formally
+                // close the dungeon session before resetting state.
                 Logger.Info("[DUNGEON-EXT] DUNGEON_COMPLETE received.");
                 TryParseCurrency(r);
+                _awaitingDungeonComplete = false;
                 if (_auto is AutoState.WaitingForBattle or AutoState.AutoBattleActive
                                                         or AutoState.WaitingForResults)
                 {
-                    // Run not yet recorded — create a minimal result and complete it.
+                    // Send PLAYER_EXIT (DungeonExtension act0=1) to formally close the dungeon.
+                    // Must be done BEFORE ResetDungeonState() clears _dungeonRoom.
+                    Logger.Debug("[DUNGEON-EXT] Sending PLAYER_EXIT to formally close dungeon session.");
+                    SendPlayerExit();
+
                     _runCount++;
                     var cfg = GetCurrentDungeon();
                     var dunResult = new DungeonResult
@@ -1284,14 +1494,22 @@ public static class BHBot
             case 11: // ITEMS_ADDED — loot added to inventory mid-dungeon
                 Logger.Debug("[DUNGEON-EXT] ITEMS_ADDED");
                 TryParseCurrency(r);
+                // Secondary activation trigger: mirrors OnItemWindowClosed() → CheckAutoPilot().
+                // Real client: item window auto-closes after 1.5s → CheckAutoPilot (no state check).
+                // Same rule as OBJECT_REMOVE: no _auto state gate, only guard mid-fight + pending.
+                if (_auto != AutoState.AutoBattleActive && !_pendingActivation)
+                    SendDungeonActivate();
                 break;
 
             case 12: // ITEMS_REMOVED
                 Logger.Debug("[DUNGEON-EXT] ITEMS_REMOVED");
                 break;
 
-            case 13: // OBJECT_DISABLE — object no longer interactable
+            case 13: // OBJECT_DISABLE — object no longer interactable (occupied, spent, etc.)
+                // DungeonExtension.OnObjectDisable() always calls CheckAutoPilot() with no state check.
                 Logger.Debug("[DUNGEON-EXT] OBJECT_DISABLE");
+                if (_auto != AutoState.AutoBattleActive && !_pendingActivation)
+                    SendDungeonActivate();
                 break;
 
             case 14: // ERROR
@@ -1320,21 +1538,27 @@ public static class BHBot
     /// </summary>
     static void OnEnterBattle(SFSObject r)
     {
+        // Clear pending flag — our DoObjectActivate was accepted, battle has begun.
+        _pendingActivation = false;
+        _waveCount++;
+        _lastBattleEvent = DateTime.UtcNow;
         _auto = AutoState.AutoBattleActive;
-        SessionStats.SetState("AutoBattleActive", "Sending AUTO");
+        SessionStats.SetWave(_waveCount);
+        SessionStats.SetState("AutoBattleActive", $"Battle {_waveCount} — sending AUTO");
+        Logger.Info($"[BATTLE] Battle {_waveCount} starting — sending AUTO");
 
+        // bat33=true in ENTER_BATTLE means a capture prompt is already waiting.
+        // Decline it; server will send a QUEUE that resumes normal combat.
         if (_config.Automation.AutoDeclineCaptures &&
             r.ContainsKey("bat33") && r.GetBool("bat33"))
         {
             int eIdx = r.ContainsKey("bat7") ? r.GetInt("bat7") : 0;
-            Logger.Info($"[BATTLE] Auto-declining pre-battle capture (entity {eIdx})");
+            Logger.Info($"[BATTLE] Capture prompt on entry — auto-declining entity {eIdx}");
             DeclineCapture(eIdx);
-            // Wait for decline ACK; capture_decline handler will re-send AUTO next tick
             return;
         }
 
-        bool dmgGain = GetCurrentDungeon().UseDamageGain;
-        SendBattleAuto(dmgGain);
+        SendBattleAuto(GetCurrentDungeon().UseDamageGain);
     }
 
     #endregion
@@ -1504,12 +1728,14 @@ public static class BHBot
 
     static void ResetDungeonState()
     {
-        _waveCount          = 0;
-        _lastBattleEvent    = DateTime.MinValue;
-        _dungeonRoom        = null;
+        _waveCount                = 0;
+        _lastBattleEvent          = DateTime.MinValue;
+        _dungeonRoom              = null;
         _dungeonObjects.Clear();
-        _navTargetRow       = -1;
-        _navTargetCol       = -1;
+        _navTargetRow             = -1;
+        _navTargetCol             = -1;
+        _pendingActivation        = false;
+        _awaitingDungeonComplete  = false;
         SessionStats.SetWave(0);
     }
 
@@ -1569,23 +1795,59 @@ public static class BHBot
                 _auto = _stateAfterCooldown;
         }
 
-        // Battle-done timeout: WaitingForBattle with ≥1 wave → dungeon is probably complete
-        if (_auto == AutoState.WaitingForBattle && _waveCount > 0)
+        // AutoBattleActive timeout: if QUEUE never arrives (or AUTO result never arrives),
+        // something went wrong — reset and retry.
+        if (_auto == AutoState.AutoBattleActive)
         {
             double elapsed = (DateTime.UtcNow - _lastBattleEvent).TotalMilliseconds;
             if (elapsed > BATTLE_DONE_TIMEOUT_MS)
             {
-                Logger.Info($"No new wave in {BATTLE_DONE_TIMEOUT_MS} ms – requesting results.");
+                Logger.Warn($"[BATTLE] No QUEUE/result in {BATTLE_DONE_TIMEOUT_MS}ms — resetting dungeon.");
+                ResetDungeonState();
+                _retryCount++;
+                SessionStats.SetRetryCount(_retryCount);
+                ScheduleCooldown(_config.Automation.RetryDelayMs, AutoState.EnteringDungeon);
+            }
+        }
+
+        // Post-battle timeout: WaitingForBattle, ≥1 battle fought, no pending activation, and
+        // no DUNGEON_COMPLETE / ENTER_BATTLE within timeout → dungeon stalled.
+        // Send RESULTS as a nudge; server should reply with DUNGEON_COMPLETE or a final QUEUE.
+        // Do NOT fire this when _pendingActivation=true (waiting for ENTER_BATTLE after DoObjectActivate)
+        // or _awaitingDungeonComplete=true (all enemies cleared, waiting for DUNGEON_COMPLETE packet).
+        if (_auto == AutoState.WaitingForBattle && _waveCount > 0 && !_pendingActivation && !_awaitingDungeonComplete)
+        {
+            double elapsed = (DateTime.UtcNow - _lastBattleEvent).TotalMilliseconds;
+            if (elapsed > BATTLE_DONE_TIMEOUT_MS)
+            {
+                Logger.Info($"[BATTLE] Stall after {BATTLE_DONE_TIMEOUT_MS} ms — sending RESULTS as fallback nudge.");
                 _auto = AutoState.WaitingForResults;
-                _lastBattleEvent = DateTime.MaxValue; // prevent re-trigger
+                _lastBattleEvent = DateTime.UtcNow;
                 SendBattleResults();
             }
         }
 
-        // ENTER_DUNGEON timeout: WaitingForBattle with 0 waves means we're still waiting for
-        // the server to send ENTER_DUNGEON (act0=1) after ENTER_ZONE_NODE was confirmed.
-        // If nothing arrives within 15 s, the dungeon entry silently failed — retry.
-        if (_auto == AutoState.WaitingForBattle && _waveCount == 0)
+        // WaitingForResults timeout: RESULTS sent but DUNGEON_COMPLETE never arrived.
+        // Give the server extra time (30 s) then force-reset the run.
+        if (_auto == AutoState.WaitingForResults)
+        {
+            double elapsed = (DateTime.UtcNow - _lastBattleEvent).TotalMilliseconds;
+            if (elapsed > BATTLE_DONE_TIMEOUT_MS * 2)
+            {
+                Logger.Warn("[BATTLE] No DUNGEON_COMPLETE after RESULTS — force-resetting run.");
+                ResetDungeonState();
+                _retryCount++;
+                SessionStats.SetRetryCount(_retryCount);
+                ScheduleCooldown(_config.Automation.RetryDelayMs, AutoState.EnteringDungeon);
+            }
+        }
+
+        // ENTER_DUNGEON / first-battle timeout:
+        //   WaitingForBattle + 0 waves + no pending activation → ENTER_DUNGEON (or ENTER_BATTLE)
+        //   never arrived after ENTER_ZONE_NODE was confirmed. Retry zone entry.
+        //   Guard !_pendingActivation: if we already sent DoObjectActivate (first enemy), we are
+        //   correctly waiting for ENTER_BATTLE — don't retry just because it hasn't fired yet.
+        if (_auto == AutoState.WaitingForBattle && _waveCount == 0 && !_pendingActivation)
         {
             double elapsed = (DateTime.UtcNow - _lastBattleEvent).TotalMilliseconds;
             if (elapsed > BATTLE_DONE_TIMEOUT_MS)
@@ -1710,9 +1972,10 @@ public static class BHBot
 
     /// <summary>
     /// Send a packet to the active dungeon room via "DungeonExtension".
-    /// All mid-dungeon actions (AUTO, RESULTS, QUIT, CAPTURE) must use this path;
-    /// the server routes them through the room's DungeonExtension handler, not ServerExtension.
-    /// Falls back to RawSend if no room is active (e.g. just entering).
+    /// Use ONLY for dungeon navigation packets (DoObjectActivate, act0=5) that have NO dal0.
+    /// BattleDALC packets (AUTO, RESULTS, QUIT, CAPTURE) go via <see cref="Send"/> instead —
+    /// they carry dal0 and are routed by ServerExtension, not the room extension.
+    /// Falls back to RawSend if no room is active.
     /// </summary>
     static void SendDungeon(SFSObject p)
     {
@@ -1720,6 +1983,19 @@ public static class BHBot
             _sfs!.Send(new ExtensionRequest(DUNGEON_EXTENSION, p, _dungeonRoom));
         else
             RawSend(p);
+    }
+
+    /// <summary>
+    /// DungeonExtension act0=1 — PLAYER_EXIT.
+    /// Mirrors DoPlayerExit() in the real client. Called only when the entire dungeon
+    /// is cleared (all enemies defeated) or when the player is defeated.
+    /// The real client's DungeonExtension.Send() adds cli1/cli2/cli3, so we use DungeonPacket().
+    /// </summary>
+    static void SendPlayerExit()
+    {
+        var p = DungeonPacket(1);   // includes cli1, cli2, cli3 — matches real client DungeonExtension.Send()
+        Logger.Debug("[DUNGEON] Sending PLAYER_EXIT (act0=1)");
+        SendDungeon(p);
     }
 
     /// <summary>
@@ -1769,10 +2045,11 @@ public static class BHBot
     /// dun7 → player start position (dun9=row, dun10=col).
     /// dun0 → array of dungeon objects (dun1=row, dun2=col, dun14=type, dun32=used).
     /// </summary>
-    static void ParseDungeonState(ISFSObject r)
+    static void ParseDungeonState(ISFSObject r, bool clearFirst = true)
     {
         _playerRow = 0; _playerCol = 0;
-        _dungeonObjects.Clear();
+        if (clearFirst) _dungeonObjects.Clear();
+        Logger.Debug($"[DUNGEON] ParseDungeonState(clearFirst={clearFirst}) packet keys: [{string.Join(", ", r.GetKeys())}]");
 
         // Player start position
         if (r.ContainsKey("dun7"))
@@ -1825,38 +2102,47 @@ public static class BHBot
     {
         if (_dungeonObjects.Count == 0)
         {
-            Logger.Debug("[DUNGEON] No dungeon objects parsed — skipping activation.");
+            Logger.Debug("[DUNGEON] No dungeon objects — skipping activation.");
             return;
         }
 
-        // Pick the nearest unused enemy/boss by Manhattan distance.
+        // Pick the nearest unused ENEMY (0) or BOSS (2) by Manhattan distance from player.
+        // Mirrors CheckAutoPilot()'s shortest-path logic (Manhattan ≈ path length on a grid).
         DungeonObjectInfo? best = null;
         int bestDist = int.MaxValue;
         foreach (var obj in _dungeonObjects)
         {
-            if (obj.Used || obj.Empty)
-            { Logger.Debug($"[DUNGEON-NAV] skip ({obj.Row},{obj.Col}) t={obj.Type} used={obj.Used} empty={obj.Empty}"); continue; }
-            if (obj.Type != 0 && obj.Type != 2)
-            { Logger.Debug($"[DUNGEON-NAV] skip ({obj.Row},{obj.Col}) t={obj.Type} (not enemy/boss)"); continue; }
+            if (obj.Used || obj.Empty) continue;
+            if (obj.Type != 0 && obj.Type != 2) continue;   // only fight ENEMY / BOSS
             int d = Math.Abs(obj.Row - _playerRow) + Math.Abs(obj.Col - _playerCol);
-            Logger.Debug($"[DUNGEON-NAV] candidate ({obj.Row},{obj.Col}) t={obj.Type} dist={d}");
+            Logger.Debug($"[DUNGEON-NAV] candidate {obj.TypeName} ({obj.Row},{obj.Col}) dist={d}");
             if (d < bestDist) { bestDist = d; best = obj; }
         }
 
         if (best == null)
         {
-            Logger.Warn("[DUNGEON] No unused enemy nodes found — cannot activate.");
+            // No more combat targets — all enemies defeated. DUNGEON_COMPLETE will arrive shortly.
+            Logger.Info("[DUNGEON] No more enemies — awaiting DUNGEON_COMPLETE.");
+            _awaitingDungeonComplete = true;
+            // Reset the stall timer so the WaitingForBattle timeout does not fire while we wait.
+            _lastBattleEvent = DateTime.UtcNow;
             return;
         }
 
-        _navTargetRow = best.Row;
-        _navTargetCol = best.Col;
+        _navTargetRow      = best.Row;
+        _navTargetCol      = best.Col;
+        _pendingActivation = true;   // guard against double-activation from OBJECT_REMOVE + ITEMS_ADDED
 
-        Logger.Info($"[DUNGEON] Autopilot activating enemy at ({_navTargetRow},{_navTargetCol}) — DoObjectActivate dun11=[{_navTargetRow}] dun12=[{_navTargetCol}]  room={((_dungeonRoom != null) ? $"id={_dungeonRoom.Id}" : "null→ServerExtension")}");
+        Logger.Info($"[DUNGEON] DoObjectActivate → {best.TypeName} ({best.Row},{best.Col}) dist={bestDist}  " +
+                    $"room={((_dungeonRoom != null) ? _dungeonRoom.Name : "null→ServerExtension")}");
 
+        // DoObjectActivate (DungeonExtension act0=5):
+        //   dun11 = int[] of row coords along path from player to target
+        //   dun12 = int[] of col coords along path
+        // We send a 1-element path (just the target) — the server accepts this for autopilot.
         var pkt = DungeonPacket(5);
-        pkt.PutIntArray("dun11", new[] { _navTargetRow });
-        pkt.PutIntArray("dun12", new[] { _navTargetCol });
+        pkt.PutIntArray("dun11", new[] { best.Row });
+        pkt.PutIntArray("dun12", new[] { best.Col });
         SendDungeon(pkt);
     }
 
