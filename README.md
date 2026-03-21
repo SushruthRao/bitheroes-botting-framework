@@ -41,8 +41,8 @@ A clientless automation bot for **Bit Heroes** (Steam). BitHeroesBot connects di
 ### 1. Clone / download
 
 ```
-git clone https://github.com/you/BitReaper.git
-cd BitReaper
+git clone https://github.com/SushruthRao/bitheroes-botting-framework.git
+cd bitheroes-botting-framework
 ```
 
 ### 2. Verify game DLLs are present
