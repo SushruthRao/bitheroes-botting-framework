@@ -185,6 +185,22 @@ The activity log at the bottom streams all bot events. Loot lines are colored to
 
 ---
 
+## Screenshots
+
+**Session stats — live counters, runs, gold, exp, and activity log**
+![Session stats](images/001841.jpg)
+
+**Dungeon Queue tab and Loot feed with rarity-colored item names**
+![Dungeon queue and loot feed](images/001842.jpg)
+
+**Summary tab — per-item breakdown after a short farming session**
+![Summary tab](images/001843.jpg)
+
+**Summary tab — longer heroic difficulty session with full item list**
+![Summary tab heroic run](images/001844.jpg)
+
+---
+
 ## Loot Color Reference
 
 Colors come directly from `RarityBook.xml` (parsed from the game server's xml0 packet), so they match the game exactly. Approximate mapping:
