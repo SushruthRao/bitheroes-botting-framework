@@ -30,6 +30,10 @@ internal static class ServerError
     public const int IN_TUTORIAL     = 10;
     /// <summary>Insufficient tickets to enter the dungeon.</summary>
     public const int NO_TICKETS      = 22;
+    /// <summary>Character is already inside a dungeon session (orphaned run).</summary>
+    public const int ALREADY_IN_DUNGEON = 0x6D; // 109
+    /// <summary>Character is already in an active battle.</summary>
+    public const int ALREADY_IN_BATTLE  = 0x6E; // 110
 }
 
 // ── Automation state machine ───────────────────────────────────────────────────
@@ -807,6 +811,23 @@ public static class BHBot
             _auto = AutoState.EnergyWait;
             SessionStats.SetState("EnergyWait", "Out of tickets — checking every 2 min");
             ScheduleCooldown(ticketPollMs, AutoState.EnteringDungeon);
+            return;
+        }
+
+        // ── Stuck in orphaned battle/dungeon ──────────────────────────────────
+        // ALREADY_IN_BATTLE (110): send QUIT to exit the active battle, then cancel the dungeon.
+        // ALREADY_IN_DUNGEON (109): cancel the orphaned dungeon session directly.
+        // Both: wait 5 s then retry dungeon entry so the server has time to clean up.
+        if (err == ServerError.ALREADY_IN_BATTLE || err == ServerError.ALREADY_IN_DUNGEON)
+        {
+            string label = err == ServerError.ALREADY_IN_BATTLE ? "ALREADY_IN_BATTLE" : "ALREADY_IN_DUNGEON";
+            Logger.Warn($"[RECOVER] {label} — sending QUIT + RECONNECT_DUNGEON(cancel) to clear stuck state.");
+            if (err == ServerError.ALREADY_IN_BATTLE)
+                Send(Packet(DALC_BATTLE, 7)); // BattleDALC QUIT
+            ReconnectDungeon(cancel: true);
+            _retryCount = 0;
+            SessionStats.SetRetryCount(0);
+            ScheduleCooldown(5_000, AutoState.EnteringDungeon);
             return;
         }
 
