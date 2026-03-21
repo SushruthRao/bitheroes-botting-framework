@@ -1,4 +1,4 @@
-# BitReaper
+# BitHeroesBot
 
 A clientless automation bot for **Bit Heroes** (Steam). BitReaper connects directly to the game's SmartFoxServer 2X backend, runs dungeon loops automatically, and tracks your loot — all without opening the game client.
 
