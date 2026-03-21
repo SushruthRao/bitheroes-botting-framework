@@ -1,4 +1,4 @@
-# BitReaper — Developer Documentation
+# BitHeroesBot — Developer Documentation
 
 Complete reference for the project structure, internal architecture, protocols, data models, and extension points.
 

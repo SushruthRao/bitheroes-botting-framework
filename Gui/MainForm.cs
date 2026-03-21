@@ -210,11 +210,44 @@ public sealed class MainForm : Form
         _stopBtn.Enabled = false;
         _stopBtn.Click += (_, _) => StopBot();
 
-        panel.Controls.AddRange(new Control[] { title, _statusLabel, _startBtn, _stopBtn });
+        var starBtn = new Button
+        {
+            Text      = "⭐  Star on GitHub",
+            Size      = new Size(130, 32),
+            BackColor = Color.FromArgb(60, 50, 10),
+            ForeColor = Color.FromArgb(255, 210, 50),
+            FlatStyle = FlatStyle.Flat,
+            Font      = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+            Cursor    = Cursors.Hand,
+        };
+        starBtn.FlatAppearance.BorderColor = Color.FromArgb(120, 100, 20);
+        starBtn.FlatAppearance.BorderSize  = 1;
+        starBtn.Click += (_, _) =>
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                "https://github.com/SushruthRao/bitheroes-botting-framework")
+                { UseShellExecute = true });
+
+        var madeByLink = new LinkLabel
+        {
+            Text            = "made by sr03",
+            Font            = new Font("Segoe UI", 8.5f),
+            AutoSize        = true,
+            LinkColor       = Color.White,
+            ActiveLinkColor = Color.FromArgb(200, 200, 200),
+            DisabledLinkColor = Color.White,
+        };
+        madeByLink.LinkClicked += (_, _) =>
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                "https://github.com/SushruthRao")
+                { UseShellExecute = true });
+
+        panel.Controls.AddRange(new Control[] { title, _statusLabel, _startBtn, _stopBtn, starBtn, madeByLink });
         panel.Resize += (_, _) =>
         {
-            _stopBtn.Location = new Point(panel.Width - 12 - _stopBtn.Width, 10);
-            _startBtn.Location = new Point(_stopBtn.Left - 8 - _startBtn.Width, 10);
+            _stopBtn.Location   = new Point(panel.Width - 12 - _stopBtn.Width, 10);
+            _startBtn.Location  = new Point(_stopBtn.Left - 8 - _startBtn.Width, 10);
+            starBtn.Location    = new Point(_startBtn.Left - 8 - starBtn.Width, 10);
+            madeByLink.Location = new Point(starBtn.Left - 8 - madeByLink.Width, 10 + (32 - madeByLink.Height) / 2);
         };
         return panel;
     }
