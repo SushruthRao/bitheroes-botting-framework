@@ -22,8 +22,9 @@ public static class Logger
     /// <summary>
     /// Fired on every log entry (on whichever thread called Log/Info/Warn/Error).
     /// The GUI subscribes to this to display entries in the activity log.
+    /// The uint is an ARGB color override (0 = use level-based default).
     /// </summary>
-    public static event Action<LogLevel, string>? LineWritten;
+    public static event Action<LogLevel, string, uint>? LineWritten;
 
     // ── Initialisation ─────────────────────────────────────────────────────────
 
@@ -65,6 +66,9 @@ public static class Logger
     public static void Error(string msg) => Write(LogLevel.Error, msg);
     public static void Debug(string msg) { if (_verboseMode) Write(LogLevel.Debug, msg); }
 
+    /// <summary>Log an Info-level message with a specific ARGB color (0 = default).</summary>
+    public static void Loot(string msg, uint argbColor) => Write(LogLevel.Info, msg, argbColor);
+
     // ── Buffer access ──────────────────────────────────────────────────────────
 
     public static string[] GetRecentLines(int count)
@@ -82,7 +86,7 @@ public static class Logger
 
     // ── Internal ───────────────────────────────────────────────────────────────
 
-    private static void Write(LogLevel level, string msg)
+    private static void Write(LogLevel level, string msg, uint argbColor = 0)
     {
         string prefix = level switch
         {
@@ -102,6 +106,6 @@ public static class Logger
         }
 
         // Fire event outside lock
-        LineWritten?.Invoke(level, line);
+        LineWritten?.Invoke(level, line, argbColor);
     }
 }

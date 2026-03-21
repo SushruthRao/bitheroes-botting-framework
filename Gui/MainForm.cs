@@ -114,7 +114,7 @@ public sealed class MainForm : Form
 
     // Thread-safe queue: Logger.LineWritten enqueues from any thread;
     // _uiTimer drains it on the UI thread so WinForms is never touched from a background thread.
-    private readonly ConcurrentQueue<(LogLevel Level, string Line)> _pendingLogLines = new();
+    private readonly ConcurrentQueue<(LogLevel Level, string Line, uint ArgbColor)> _pendingLogLines = new();
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -910,14 +910,24 @@ public sealed class MainForm : Form
         using (var stripBrush = new SolidBrush(strip))
             e.Graphics.FillRectangle(stripBrush, e.Bounds.X, e.Bounds.Y, 4, e.Bounds.Height);
 
-        // Row text colour
-        Color fg = entry.NewLevel > 0
-            ? Color.FromArgb(120, 220, 100)
-            : hasNamed
-                ? Color.FromArgb(220, 195, 115)
-                : entry.GoldDelta > 0
-                    ? Color.FromArgb(200, 200, 140)
-                    : Color.FromArgb(180, 80, 80);
+        // Row text colour: use the highest-rarity item's color when available
+        string? bestRarity = entry.Items
+            .Where(i => !i.IsCurrency)
+            .Select(i => ItemNameLookup.ResolveRarity(i.ItemId, i.ItemType))
+            .Where(r => r != null)
+            .OrderByDescending(r => RarityColorLookup.GetRank(r))
+            .FirstOrDefault();
+        uint bestArgb = RarityColorLookup.GetArgb(bestRarity);
+
+        Color fg = bestArgb != 0
+            ? Color.FromArgb((int)bestArgb)
+            : entry.NewLevel > 0
+                ? Color.FromArgb(120, 220, 100)
+                : hasNamed
+                    ? Color.FromArgb(220, 195, 115)
+                    : entry.GoldDelta > 0
+                        ? Color.FromArgb(200, 200, 140)
+                        : Color.FromArgb(180, 80, 80);
 
         using var fgBrush = new SolidBrush(fg);
         e.Graphics.DrawString(entry.Summary(), e.Font!, fgBrush,
@@ -1001,14 +1011,17 @@ public sealed class MainForm : Form
 
         _lootSummaryList.DrawSubItem += (_, e) =>
         {
-            int type = e.Item.Tag is int t ? t : -1;
+            var (type, rarity) = e.Item.Tag is ValueTuple<int, string?> tup ? (tup.Item1, tup.Item2) : (-1, (string?)null);
             var font = _lootSummaryList.Font;
             if (e.ColumnIndex == 0)
             {
                 // Small colored chip indicating item type
                 using var chip = new SolidBrush(ItemTypeColor(type));
                 e.Graphics.FillRectangle(chip, e.Bounds.X + 3, e.Bounds.Y + 4, 6, e.Bounds.Height - 8);
-                using var fg = new SolidBrush(Color.FromArgb(210, 215, 220));
+                // Item name: use rarity color when known, else default
+                uint rarArgb = RarityColorLookup.GetArgb(rarity);
+                Color nameColor = rarArgb != 0 ? Color.FromArgb((int)rarArgb) : Color.FromArgb(210, 215, 220);
+                using var fg = new SolidBrush(nameColor);
                 e.Graphics.DrawString(e.SubItem?.Text ?? "", font, fg,
                     e.Bounds.X + 13, e.Bounds.Y + 2);
             }
@@ -1344,9 +1357,9 @@ public sealed class MainForm : Form
             _lootSummaryTotal = breakdownTotal;
             _lootSummaryList.BeginUpdate();
             _lootSummaryList.Items.Clear();
-            foreach (var (name, type, qty) in breakdown)
+            foreach (var (name, type, qty, rarity) in breakdown)
             {
-                var item = new ListViewItem(name) { Tag = type };
+                var item = new ListViewItem(name) { Tag = (type, rarity) };
                 item.SubItems.Add(qty.ToString("N0"));
                 _lootSummaryList.Items.Add(item);
             }
@@ -1361,8 +1374,8 @@ public sealed class MainForm : Form
 
     // Called on whatever thread writes to the Logger (SFS2X socket thread, UI thread, etc.).
     // We NEVER touch WinForms controls here. The queue is drained by _uiTimer on the UI thread.
-    private void OnLogLine(LogLevel level, string line) =>
-        _pendingLogLines.Enqueue((level, line));
+    private void OnLogLine(LogLevel level, string line, uint argbColor) =>
+        _pendingLogLines.Enqueue((level, line, argbColor));
 
     // ── Log flush (called by RefreshStats on the UI timer) ───────────────────
 
@@ -1375,13 +1388,15 @@ public sealed class MainForm : Form
         _logBox.BeginUpdate();
         while (_pendingLogLines.TryDequeue(out var entry))
         {
-            Color c = entry.Level switch
-            {
-                LogLevel.Warn  => Color.FromArgb(255, 200, 60),
-                LogLevel.Error => Color.FromArgb(230, 90, 90),
-                LogLevel.Debug => Color.FromArgb(120, 120, 120),
-                _              => Color.FromArgb(200, 200, 200)
-            };
+            Color c = entry.ArgbColor != 0
+                ? Color.FromArgb((int)entry.ArgbColor)
+                : entry.Level switch
+                {
+                    LogLevel.Warn  => Color.FromArgb(255, 200, 60),
+                    LogLevel.Error => Color.FromArgb(230, 90, 90),
+                    LogLevel.Debug => Color.FromArgb(120, 120, 120),
+                    _              => Color.FromArgb(200, 200, 200)
+                };
             _logBox.Items.Add((c, entry.Line));
             added = true;
         }

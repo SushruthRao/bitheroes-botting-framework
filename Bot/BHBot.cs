@@ -1317,7 +1317,12 @@ public static class BHBot
                         string lootSummary = entry.Summary();
                         Logger.Info($"[BATTLE] Encounter WON ({tag}) — {lootSummary}");
                         foreach (var item in battleLoot)
-                            Logger.Info($"  [LOOT] {item}");
+                        {
+                            string? rar = item.IsCurrency ? null
+                                : ItemNameLookup.ResolveRarity(item.ItemId, item.ItemType);
+                            uint col = RarityColorLookup.GetArgb(rar);
+                            Logger.Loot($"  [LOOT] {item}", col);
+                        }
 
                         // Real client: CheckAutoPilot → DoObjectActivate for next enemy.
                         SendDungeonActivate();
@@ -2693,13 +2698,35 @@ public static class BHBot
                 if (entry == null) continue;
 
                 string filename = entry.ContainsKey("xml1") ? entry.GetUtfString("xml1") : "";
-                int type = BookFileToType(filename);
-                if (type < 0) continue; // not an item book we care about
 
                 if (!entry.ContainsKey("xml2")) continue;
                 var ba = entry.GetByteArray("xml2");
                 ba.Uncompress(); // zlib decompress in-place
                 string xml = Encoding.UTF8.GetString(ba.Bytes);
+
+                // RarityBook — extract link→textColor for loot coloring
+                if (filename == "RarityBook.xml")
+                {
+                    try
+                    {
+                        var rdoc = XDocument.Parse(xml);
+                        int rank = 0;
+                        foreach (var el in rdoc.Root?.Elements() ?? Enumerable.Empty<XElement>())
+                        {
+                            string? link  = (string?)el.Attribute("link");
+                            string? color = (string?)el.Attribute("textColor");
+                            int.TryParse((string?)el.Attribute("id"), out int rarId);
+                            if (link != null && color != null)
+                                RarityColorLookup.Register(link, color, rarId);
+                            rank++;
+                        }
+                    }
+                    catch { /* best effort */ }
+                    continue;
+                }
+
+                int type = BookFileToType(filename);
+                if (type < 0) continue; // not an item book we care about
 
                 // Dump raw XML to file for inspection
                 try
@@ -2802,7 +2829,7 @@ public static class BHBot
                     if (char.IsLower(name[0]))
                         name = char.ToUpper(name[0]) + name[1..];
 
-                    ItemNameLookup.Register(id, type, name);
+                    ItemNameLookup.Register(id, type, name, d.rarity);
                     total++;
                 }
             }

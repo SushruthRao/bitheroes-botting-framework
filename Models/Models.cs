@@ -66,18 +66,46 @@ public static class LanguageLookup
     public static int Count => _strings.Count;
 }
 
+// ── Rarity color lookup (populated from RarityBook.xml in xml0 packet) ───────
+// Maps rarity link string (e.g. "common", "rare") → ARGB uint for WinForms Color.
+
+public static class RarityColorLookup
+{
+    static readonly Dictionary<string, (uint argb, int rank)> _colors = new();
+
+    /// <summary>Register a rarity link with its 6-char hex textColor and numeric rank (RarityBook id).</summary>
+    public static void Register(string link, string hexColor, int rank)
+    {
+        if (hexColor.Length == 6 &&
+            uint.TryParse(hexColor, System.Globalization.NumberStyles.HexNumber, null, out uint rgb))
+            _colors[link.ToLower()] = (0xFF000000u | rgb, rank);
+    }
+
+    /// <summary>Returns the ARGB color for the given rarity link, or 0 if unknown.</summary>
+    public static uint GetArgb(string? link) =>
+        link != null && _colors.TryGetValue(link.ToLower(), out var c) ? c.argb : 0;
+
+    /// <summary>Returns the numeric rank (higher = rarer) for the given rarity link, or -1 if unknown.</summary>
+    public static int GetRank(string? link) =>
+        link != null && _colors.TryGetValue(link.ToLower(), out var c) ? c.rank : -1;
+}
+
 // ── Item name lookup (populated from LOAD_XMLS xml0 books) ────────────────────
 
 public static class ItemNameLookup
 {
-    static readonly Dictionary<(int id, int type), string> _names = new();
+    static readonly Dictionary<(int id, int type), (string name, string? rarity)> _items = new();
 
-    public static void Register(int id, int type, string name) => _names[(id, type)] = name;
+    public static void Register(int id, int type, string name, string? rarityLink = null) =>
+        _items[(id, type)] = (name, rarityLink);
 
     public static string? Resolve(int id, int type) =>
-        _names.TryGetValue((id, type), out var name) ? name : null;
+        _items.TryGetValue((id, type), out var v) ? v.name : null;
 
-    public static int Count => _names.Count;
+    public static string? ResolveRarity(int id, int type) =>
+        _items.TryGetValue((id, type), out var v) ? v.rarity : null;
+
+    public static int Count => _items.Count;
 }
 
 // ── Loot entry (one battle's rewards) ──────────────────────────────────────────
@@ -289,26 +317,26 @@ public static class SessionStats
 
     // ── Item drop breakdown (full session, keyed by display name) ─────────────
 
-    // key = resolved item name or TypeLabel fallback; value = (itemType, totalQty)
-    private static readonly Dictionary<string, (int type, int qty)> _itemBreakdown = new();
+    // key = resolved item name or TypeLabel fallback; value = (itemType, totalQty, rarityLink)
+    private static readonly Dictionary<string, (int type, int qty, string? rarity)> _itemBreakdown = new();
     private static readonly object _itemLock = new();
 
-    public static void RecordItemDrop(int itemType, string displayName, int qty)
+    public static void RecordItemDrop(int itemType, string displayName, int qty, string? rarityLink = null)
     {
         lock (_itemLock)
         {
             if (_itemBreakdown.TryGetValue(displayName, out var existing))
-                _itemBreakdown[displayName] = (existing.type, existing.qty + qty);
+                _itemBreakdown[displayName] = (existing.type, existing.qty + qty, existing.rarity ?? rarityLink);
             else
-                _itemBreakdown[displayName] = (itemType, qty);
+                _itemBreakdown[displayName] = (itemType, qty, rarityLink);
         }
     }
 
-    public static IReadOnlyList<(string name, int type, int qty)> GetItemBreakdown()
+    public static IReadOnlyList<(string name, int type, int qty, string? rarity)> GetItemBreakdown()
     {
         lock (_itemLock)
             return _itemBreakdown
-                .Select(kv => (kv.Key, kv.Value.type, kv.Value.qty))
+                .Select(kv => (kv.Key, kv.Value.type, kv.Value.qty, kv.Value.rarity))
                 .OrderByDescending(t => t.qty)
                 .ToList();
     }
@@ -344,8 +372,9 @@ public static class SessionStats
         _totalItems += nonCurrency.Count;
         foreach (var item in nonCurrency)
         {
-            var name = ItemNameLookup.Resolve(item.ItemId, item.ItemType) ?? item.TypeLabel;
-            RecordItemDrop(item.ItemType, name, item.Qty);
+            var name    = ItemNameLookup.Resolve(item.ItemId, item.ItemType) ?? item.TypeLabel;
+            var rarity  = ItemNameLookup.ResolveRarity(item.ItemId, item.ItemType);
+            RecordItemDrop(item.ItemType, name, item.Qty, rarity);
         }
         lock (_lootLock)
         {
