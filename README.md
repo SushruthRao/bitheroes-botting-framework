@@ -30,7 +30,7 @@ A clientless automation bot for **Bit Heroes** (Steam). BitHeroesBot connects di
 | Bit Heroes | Installed via Steam (latest) |
 | Steam | Running and logged in |
 
-> Steam must be running when BitReaper starts — it uses the Steam auth ticket for login.
+> Steam must be running when Bot starts — it uses the Steam auth ticket for login.
 
 ---
 
@@ -214,7 +214,7 @@ The selected zone/node is not yet unlocked on your character. Use a lower zone o
 The bot pulls item names from two sources: the server's `xml0` packet (sent after login) and the local Unity bundle cache. If both are unavailable, it falls back to type+id. Wait for a successful login cycle — names populate automatically.
 
 **Language strings not loading**
-BitReaper looks for the DLC bundle cache at `%LocalLow%\Unity\Ultrabit_Bit Heroes\xml\`. Play the game at least once so Steam downloads and caches the bundles.
+Bot looks for the DLC bundle cache at `%LocalLow%\Unity\Ultrabit_Bit Heroes\xml\`. Play the game at least once so Steam downloads and caches the bundles.
 
 **`autoClaimDailyQuests` causes disconnect**
 Leave this `false`. The action numbers for the daily quest flow are unverified and sending the wrong packet causes the server to disconnect.
