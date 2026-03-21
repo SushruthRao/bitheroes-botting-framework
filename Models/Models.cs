@@ -20,29 +20,47 @@ public sealed class LootItem
     public int ItemType { get; init; }
     public int Qty      { get; init; }
 
-    // ItemType constants from ItemBook (decompile cross-ref):
-    //   0=Equipment  1=Consumable  2=Familiar  3=Currency  4=Quest  5=Craft
+    // ItemType constants from ItemBook.Lookup switch (ite1 wire field):
+    //   1=Equipment  2=Material  3=Currency  4=Consumable
+    //   6=Familiar   8=Mount     9=Rune      11=Enchant   15=Augment
     // Currency ItemId: 1=Gold  2=Credits  3=EXP  4=Energy  5=Tickets  67=Shards
-    // Note: real item names come from ItemBook XML loaded by doLoadXMLs().
-    //       The wire packet only carries id/type/qty, so names are unavailable here.
     public string TypeLabel => ItemType switch
     {
-        0 => "Equipment",
-        1 => "Consumable",
-        2 => "Familiar",
-        3 => ItemId switch { 1 => "Gold", 2 => "Credits", 3 => "EXP",
-                             4 => "Energy", 5 => "Tickets", 67 => "Shards", _ => "Currency" },
-        4 => "Quest",
-        5 => "Craft",
-        6 => "Familiar",   // familiar as inventory item (ite1=6 from GetItemsByType(6))
-        _ => $"Type{ItemType}"
+        1  => "Equipment",
+        2  => "Material",
+        3  => ItemId switch { 1 => "Gold", 2 => "Credits", 3 => "EXP",
+                              4 => "Energy", 5 => "Tickets", 67 => "Shards", _ => "Currency" },
+        4  => "Consumable",
+        6  => "Familiar",
+        8  => "Mount",
+        9  => "Rune",
+        11 => "Enchant",
+        15 => "Augment",
+        _  => $"Type{ItemType}"
     };
 
     public bool IsCurrency => ItemType == 3;
 
-    public override string ToString() => IsCurrency
-        ? $"{TypeLabel}×{Qty:N0}"
-        : $"{TypeLabel}(id={ItemId})×{Qty}";
+    public override string ToString()
+    {
+        if (IsCurrency) return $"{TypeLabel}×{Qty:N0}";
+        var name = ItemNameLookup.Resolve(ItemId, ItemType);
+        return name != null ? $"{name}×{Qty}" : $"{TypeLabel}(id={ItemId})×{Qty}";
+    }
+}
+
+// ── Item name lookup (populated from LOAD_XMLS xml0 books) ────────────────────
+
+public static class ItemNameLookup
+{
+    static readonly Dictionary<(int id, int type), string> _names = new();
+
+    public static void Register(int id, int type, string name) => _names[(id, type)] = name;
+
+    public static string? Resolve(int id, int type) =>
+        _names.TryGetValue((id, type), out var name) ? name : null;
+
+    public static int Count => _names.Count;
 }
 
 // ── Loot entry (one battle's rewards) ──────────────────────────────────────────

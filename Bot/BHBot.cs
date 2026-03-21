@@ -9,6 +9,7 @@ using Sfs2X.Requests;
 using Steamworks;
 using System.Security.Cryptography;
 using System.Text;
+using System.Xml.Linq;
 
 namespace BitHeroesClient.Bot;
 
@@ -963,6 +964,7 @@ public static class BHBot
                 SessionStats.SetState("InGame");
                 TryParseCurrency(r);
                 ScanForTeamData(r);
+                ParseItemXmlBooks(r);
                 OnInGame?.Invoke();
                 BeginAutomation();
                 break;
@@ -2214,14 +2216,16 @@ public static class BHBot
                         if (lootItems.Count > 0)
                         {
                             var cfg = GetCurrentDungeon();
+                            long goldDelta = lootItems.Where(i => i.IsCurrency && i.ItemId == 1).Sum(i => (long)i.Qty);
+                            long expDelta  = lootItems.Where(i => i.IsCurrency && i.ItemId == 3).Sum(i => (long)i.Qty);
                             Logger.Info($"[LOOT] ({oRow},{oCol}) {string.Join(", ", lootItems.Select(li => li.ToString()))}");
                             SessionStats.RecordEncounter(true, new LootEntry
                             {
                                 Time      = DateTime.UtcNow,
                                 ZoneId    = cfg.ZoneId,
                                 NodeId    = cfg.NodeId,
-                                GoldDelta = 0,
-                                ExpDelta  = 0,
+                                GoldDelta = goldDelta,
+                                ExpDelta  = expDelta,
                                 Items     = lootItems,
                             });
                         }
@@ -2341,6 +2345,66 @@ public static class BHBot
             Logger.Debug($"[LOOT] ParseLootItems error: {ex.Message}");
         }
         return items;
+    }
+
+    /// <summary>
+    /// Parses the xml0 SFSArray from a LOAD_XMLS response and populates ItemNameLookup.
+    /// Each element has xml1 (book filename) and xml2 (zlib-compressed XML bytes).
+    /// statname attribute is used as the display name (direct); name is a localisation key.
+    /// </summary>
+    static void ParseItemXmlBooks(ISFSObject r)
+    {
+        if (!r.ContainsKey("xml0")) return;
+        try
+        {
+            // Map book filenames to their ite1 type numbers (from ItemBook.Lookup switch)
+            static int BookFileToType(string file) => file switch
+            {
+                "EquipmentBook.xml"  => 1,
+                "MaterialBook.xml"   => 2,
+                "ConsumableBook.xml" => 4,
+                "FamiliarBook.xml"   => 6,
+                "MountBook.xml"      => 8,
+                "RuneBook.xml"       => 9,
+                "EnchantBook.xml"    => 11,
+                "AugmentBook.xml"    => 15,
+                _                    => -1,
+            };
+
+            var arr = r.GetSFSArray("xml0");
+            int total = 0;
+            for (int i = 0; i < arr.Size(); i++)
+            {
+                var entry = arr.GetSFSObject(i);
+                if (entry == null) continue;
+
+                string filename = entry.ContainsKey("xml1") ? entry.GetUtfString("xml1") : "";
+                int type = BookFileToType(filename);
+                if (type < 0) continue; // not an item book we care about
+
+                if (!entry.ContainsKey("xml2")) continue;
+                var ba = entry.GetByteArray("xml2");
+                ba.Uncompress(); // zlib decompress in-place
+                string xml = Encoding.UTF8.GetString(ba.Bytes);
+
+                var doc = XDocument.Parse(xml);
+                foreach (var el in doc.Root?.Elements() ?? Enumerable.Empty<XElement>())
+                {
+                    if (!int.TryParse((string?)el.Attribute("id"), out int id)) continue;
+                    // statname = direct display label; fall back to name if absent
+                    string? displayName = (string?)el.Attribute("statname")
+                                       ?? (string?)el.Attribute("name");
+                    if (string.IsNullOrEmpty(displayName)) continue;
+                    ItemNameLookup.Register(id, type, displayName);
+                    total++;
+                }
+            }
+            Logger.Info($"[XML] Loaded {total} item names from xml0 books.");
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[XML] ParseItemXmlBooks failed: {ex.Message}");
+        }
     }
 
     /// <summary>
