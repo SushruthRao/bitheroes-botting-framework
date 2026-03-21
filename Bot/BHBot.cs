@@ -1596,15 +1596,41 @@ public static class BHBot
                 }
                 break;
 
-            case 11: // ITEMS_ADDED — loot added to inventory mid-dungeon
-                Logger.Debug("[DUNGEON-EXT] ITEMS_ADDED");
+            case 11: // ITEMS_ADDED — loot granted after activating a TREASURE/LOOTABLE object
+            {
                 TryParseCurrency(r);
+                // ITEMS_ADDED is the loot-object equivalent of ENTER_BATTLE for enemies:
+                // it signals the activation completed and items have been granted.
+                // Clear _pendingActivation so SendDungeonActivate() can fire the next target.
+                _pendingActivation = false;
+                // Parse and log the items granted by this loot object.
+                // The server uses "ite3" (same SFSArray key as battle loot) for the item list.
+                var lootItems = ParseLootItems(r);
+                if (lootItems.Count > 0)
+                {
+                    var cfg = GetCurrentDungeon();
+                    var lootEntry = new LootEntry
+                    {
+                        Time      = DateTime.UtcNow,
+                        ZoneId    = cfg.ZoneId,
+                        NodeId    = cfg.NodeId,
+                        GoldDelta = 0,   // currency already handled by TryParseCurrency
+                        ExpDelta  = 0,
+                        Items     = lootItems,
+                    };
+                    Logger.Info($"[LOOT] Object loot: {string.Join(", ", lootItems.Select(i => i.ToString()))}");
+                    SessionStats.RecordEncounter(true, lootEntry);
+                }
+                else
+                {
+                    Logger.Debug("[DUNGEON-EXT] ITEMS_ADDED (no ite3 items)");
+                }
                 // Secondary activation trigger: mirrors OnItemWindowClosed() → CheckAutoPilot().
                 // Real client: item window auto-closes after 1.5s → CheckAutoPilot (no state check).
-                // Same rule as OBJECT_REMOVE: no _auto state gate, only guard mid-fight + pending.
-                if (_auto != AutoState.AutoBattleActive && !_pendingActivation)
+                if (_auto != AutoState.AutoBattleActive)
                     SendDungeonActivate();
                 break;
+            }
 
             case 12: // ITEMS_REMOVED
                 Logger.Debug("[DUNGEON-EXT] ITEMS_REMOVED");
@@ -2179,6 +2205,29 @@ public static class BHBot
                     bool oEmp  = o.ContainsKey("dun28") && o.GetBool("dun28");
                     Logger.Debug($"[DUNGEON-OBJ] ({oRow},{oCol}) type={oType} used={oUsed} empty={oEmp}  " +
                                  $"keys=[{string.Join(",", o.GetKeys())}]");
+
+                    // LOOTABLE (type 4): ite3 is already in the dun0 packet — read items immediately
+                    // like TriggerObject() does client-side, without sending DoObjectActivate.
+                    if (oType == 4 && !oUsed && !oEmp)
+                    {
+                        var lootItems = ParseLootItems(o);
+                        if (lootItems.Count > 0)
+                        {
+                            var cfg = GetCurrentDungeon();
+                            Logger.Info($"[LOOT] ({oRow},{oCol}) {string.Join(", ", lootItems.Select(li => li.ToString()))}");
+                            SessionStats.RecordEncounter(true, new LootEntry
+                            {
+                                Time      = DateTime.UtcNow,
+                                ZoneId    = cfg.ZoneId,
+                                NodeId    = cfg.NodeId,
+                                GoldDelta = 0,
+                                ExpDelta  = 0,
+                                Items     = lootItems,
+                            });
+                        }
+                        oUsed = true; // mark handled so SendDungeonActivate ignores it
+                    }
+
                     _dungeonObjects.Add(new DungeonObjectInfo(oRow, oCol, oType, oUsed, oEmp));
                 }
                 Logger.Debug($"[DUNGEON] Parsed {_dungeonObjects.Count} dungeon object(s): " +
@@ -2203,12 +2252,13 @@ public static class BHBot
 
         // Pick the nearest unused ENEMY (0) or BOSS (2) by Manhattan distance from player.
         // Mirrors CheckAutoPilot()'s shortest-path logic (Manhattan ≈ path length on a grid).
+        // LOOTABLE (4) objects are pre-looted at dungeon load from ite3 in dun0 and marked Used.
         DungeonObjectInfo? best = null;
         int bestDist = int.MaxValue;
         foreach (var obj in _dungeonObjects)
         {
             if (obj.Used || obj.Empty) continue;
-            if (obj.Type != 0 && obj.Type != 2) continue;   // only fight ENEMY / BOSS
+            if (obj.Type != 0 && obj.Type != 2) continue; // only ENEMY / BOSS
             int d = Math.Abs(obj.Row - _playerRow) + Math.Abs(obj.Col - _playerCol);
             Logger.Debug($"[DUNGEON-NAV] candidate {obj.TypeName} ({obj.Row},{obj.Col}) dist={d}");
             if (d < bestDist) { bestDist = d; best = obj; }
@@ -2216,7 +2266,7 @@ public static class BHBot
 
         if (best == null)
         {
-            // No more combat targets — all enemies defeated. DUNGEON_COMPLETE will arrive shortly.
+            // No more enemies — all defeated. DUNGEON_COMPLETE will arrive shortly.
             Logger.Info("[DUNGEON] No more enemies — awaiting DUNGEON_COMPLETE.");
             _awaitingDungeonComplete = true;
             // Reset the stall timer so the WaitingForBattle timeout does not fire while we wait.

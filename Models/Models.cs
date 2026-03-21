@@ -23,23 +23,26 @@ public sealed class LootItem
     // ItemType constants from ItemBook (decompile cross-ref):
     //   0=Equipment  1=Consumable  2=Familiar  3=Currency  4=Quest  5=Craft
     // Currency ItemId: 1=Gold  2=Credits  3=EXP  4=Energy  5=Tickets  67=Shards
+    // Note: real item names come from ItemBook XML loaded by doLoadXMLs().
+    //       The wire packet only carries id/type/qty, so names are unavailable here.
     public string TypeLabel => ItemType switch
     {
-        0 => "Equip",
-        1 => "Consum",
-        2 => "Famil",
+        0 => "Equipment",
+        1 => "Consumable",
+        2 => "Familiar",
         3 => ItemId switch { 1 => "Gold", 2 => "Credits", 3 => "EXP",
-                             4 => "Energy", 5 => "Tickets", 67 => "Shards", _ => "Curr" },
+                             4 => "Energy", 5 => "Tickets", 67 => "Shards", _ => "Currency" },
         4 => "Quest",
         5 => "Craft",
-        _ => $"T{ItemType}"
+        6 => "Familiar",   // familiar as inventory item (ite1=6 from GetItemsByType(6))
+        _ => $"Type{ItemType}"
     };
 
     public bool IsCurrency => ItemType == 3;
 
     public override string ToString() => IsCurrency
         ? $"{TypeLabel}×{Qty:N0}"
-        : $"{TypeLabel} #{ItemId}×{Qty}";
+        : $"{TypeLabel}(id={ItemId})×{Qty}";
 }
 
 // ── Loot entry (one battle's rewards) ──────────────────────────────────────────
