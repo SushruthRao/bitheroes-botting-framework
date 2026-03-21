@@ -964,6 +964,7 @@ public static class BHBot
                 SessionStats.SetState("InGame");
                 TryParseCurrency(r);
                 ScanForTeamData(r);
+                LoadLanguageStrings();
                 ParseItemXmlBooks(r);
                 OnInGame?.Invoke();
                 BeginAutomation();
@@ -2352,6 +2353,319 @@ public static class BHBot
     /// Each element has xml1 (book filename) and xml2 (zlib-compressed XML bytes).
     /// statname attribute is used as the display name (direct); name is a localisation key.
     /// </summary>
+    static void LoadLanguageStrings()
+    {
+        // Language.Init() in the game receives the content of "languages/english.xml" — a Unity
+        // TextAsset stored in the "xml" AssetBundle, downloaded from CDN and cached in LocalLow.
+        // We decompress that cached bundle (UnityFS/LZ4 format) and extract the English XML.
+        // On the first run this costs ~100 ms; the result is saved to language_english.xml for reuse.
+        try
+        {
+            string localLow = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                @"..\LocalLow");
+            string dumpFile = Path.Combine(localLow, @"Unity\Ultrabit_Bit Heroes\language_english.xml");
+
+            if (File.Exists(dumpFile))
+            {
+                int count = ParseLanguageXml(File.ReadAllBytes(dumpFile));
+                Logger.Info($"[LANG] Loaded {count} strings from cached language file.");
+            }
+            else
+            {
+                Logger.Info("[LANG] Extracting language strings from Unity bundle cache...");
+                byte[]? engXml = ExtractEnglishXmlFromBundleCache(localLow);
+                if (engXml != null)
+                {
+                    File.WriteAllBytes(dumpFile, engXml);   // save for next run
+                    int count = ParseLanguageXml(engXml);
+                    Logger.Info($"[LANG] Loaded {count} strings (extracted from bundle, saved to cache).");
+                }
+                else
+                {
+                    Logger.Warn("[LANG] Could not extract language strings — item names will use icon-based fallback.");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[LANG] LoadLanguageStrings failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Finds the most-recently-modified "xml" Unity AssetBundle cache file in LocalLow,
+    /// decompresses its LZ4 data blocks, and returns the English language XML bytes.
+    /// Returns null if extraction fails for any reason.
+    /// </summary>
+    static byte[]? ExtractEnglishXmlFromBundleCache(string localLow)
+    {
+        try
+        {
+            string xmlDir = Path.Combine(localLow, @"Unity\Ultrabit_Bit Heroes\xml");
+            if (!Directory.Exists(xmlDir)) return null;
+
+            var bundleFile = Directory.GetDirectories(xmlDir)
+                .Select(d => Path.Combine(d, "__data"))
+                .Where(File.Exists)
+                .OrderByDescending(File.GetLastWriteTime)
+                .FirstOrDefault();
+            if (bundleFile == null) return null;
+
+            Logger.Info($"[LANG] Decompressing bundle: {Path.GetDirectoryName(bundleFile)}");
+            byte[] decompressed = DecompressUnityFsBundle(bundleFile);
+            return FindEnglishLanguageXml(decompressed);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[LANG] ExtractEnglishXmlFromBundleCache failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Parses a Unity AssetBundle (UnityFS format v8) and returns the concatenated
+    /// decompressed bytes of all data blocks.  Supports LZ4 and LZ4HC block compression.
+    /// </summary>
+    static byte[] DecompressUnityFsBundle(string path)
+    {
+        using var fs = File.OpenRead(path);
+
+        // ── Header (all multi-byte fields are big-endian) ─────────────────────
+        fs.Seek(8, SeekOrigin.Begin);    // skip "UnityFS\0"
+        ReadInt32BE(fs);                  // format version
+        ReadNullTermString(fs);           // Unity version  ("5.x.x")
+        ReadNullTermString(fs);           // generator version ("2022.3.62f2")
+        ReadInt64BE(fs);                  // total file size
+        int compInfoSize   = ReadInt32BE(fs);   // compressed size of blocks-info chunk
+        int uncompInfoSize = ReadInt32BE(fs);   // uncompressed size
+        int flags          = ReadInt32BE(fs);
+        long dataStart = fs.Position;
+
+        bool blocksInfoAtEnd = (flags & 0x40) != 0;
+        int  infoCompType    = flags & 0x3F;    // compression type for blocks-info itself
+
+        // ── Read blocks-info chunk ────────────────────────────────────────────
+        if (blocksInfoAtEnd)
+            fs.Seek(-compInfoSize, SeekOrigin.End);
+
+        byte[] rawInfo = new byte[compInfoSize];
+        fs.ReadExactly(rawInfo);
+
+        byte[] blocksInfo = infoCompType == 0
+            ? rawInfo
+            : DecompressLz4(rawInfo, uncompInfoSize);
+
+        // ── Parse blocks-info ─────────────────────────────────────────────────
+        // Layout: Hash128 (16) | uint32 blockCount
+        //         per-block: uint32 uncompressedSize, uint32 compressedSize, uint16 bFlags
+        int bi = 16;  // skip Hash128
+        int blockCount = ReadInt32BEFromArray(blocksInfo, bi); bi += 4;
+
+        var blocks = new (int uSize, int cSize, int bFlags)[blockCount];
+        for (int i = 0; i < blockCount; i++)
+        {
+            blocks[i].uSize  = ReadInt32BEFromArray(blocksInfo, bi);     bi += 4;
+            blocks[i].cSize  = ReadInt32BEFromArray(blocksInfo, bi);     bi += 4;
+            blocks[i].bFlags = ReadInt16BEFromArray(blocksInfo, bi);     bi += 2;
+        }
+
+        // ── Decompress data blocks ────────────────────────────────────────────
+        // Flag 0x80 = kArchiveBlockInfoNeedPaddingAtStart: header is padded to a
+        // 16-byte boundary before the first data block.  0xC0 sets both 0x40 and 0x80.
+        long alignedDataStart = ((flags & 0x80) != 0)
+            ? (dataStart + 15) & ~15L
+            : dataStart;
+        fs.Seek(alignedDataStart, SeekOrigin.Begin);
+
+        int totalSize = 0;
+        foreach (var b in blocks) totalSize += b.uSize;
+        var output = new byte[totalSize];
+        int outPos = 0;
+
+        var compBuf = new byte[131072 + 4096];
+        foreach (var (uSize, cSize, bFlags) in blocks)
+        {
+            if (compBuf.Length < cSize) compBuf = new byte[cSize];
+            fs.ReadExactly(compBuf, 0, cSize);
+
+            int blockComp = bFlags & 0x3F;
+            if (blockComp == 0)
+            {
+                Buffer.BlockCopy(compBuf, 0, output, outPos, cSize);
+                outPos += cSize;
+            }
+            else if (blockComp == 2 || blockComp == 3)  // LZ4 / LZ4HC
+            {
+                DecompressLz4Into(compBuf.AsSpan(0, cSize), output.AsSpan(outPos, uSize));
+                outPos += uSize;
+            }
+            else throw new NotSupportedException($"Block compression type {blockComp} not supported");
+        }
+        return output;
+    }
+
+    /// <summary>LZ4 block-format decompressor returning a new byte[].</summary>
+    static byte[] DecompressLz4(byte[] src, int uncompressedSize)
+    {
+        var dst = new byte[uncompressedSize];
+        DecompressLz4Into(src.AsSpan(), dst.AsSpan());
+        return dst;
+    }
+
+    /// <summary>LZ4 block-format decompressor writing directly into <paramref name="dst"/>.</summary>
+    static void DecompressLz4Into(ReadOnlySpan<byte> src, Span<byte> dst)
+    {
+        int sPos = 0, dPos = 0;
+        while (sPos < src.Length)
+        {
+            byte token = src[sPos++];
+
+            // Literal run length (high nibble)
+            int litLen = token >> 4;
+            if (litLen == 15)
+            {
+                byte b;
+                do { b = src[sPos++]; litLen += b; } while (b == 255);
+            }
+            src.Slice(sPos, litLen).CopyTo(dst.Slice(dPos));
+            sPos += litLen;
+            dPos += litLen;
+
+            if (sPos >= src.Length) break;  // last sequence: no match portion
+
+            // Match offset (LE uint16)
+            int offset = src[sPos] | (src[sPos + 1] << 8);
+            sPos += 2;
+
+            // Match length (low nibble + 4 minimum)
+            int matchLen = (token & 0xF) + 4;
+            if (matchLen == 19)  // nibble was 15 → read extra length bytes
+            {
+                byte b;
+                do { b = src[sPos++]; matchLen += b; } while (b == 255);
+            }
+
+            // Copy from back-reference (may overlap current position — must go byte-by-byte)
+            int matchPos = dPos - offset;
+            for (int i = 0; i < matchLen; i++) dst[dPos++] = dst[matchPos++];
+        }
+    }
+
+    // ── Big-endian binary helpers ─────────────────────────────────────────────
+
+    static int ReadInt32BE(Stream s)
+    {
+        Span<byte> b = stackalloc byte[4];
+        s.ReadExactly(b);
+        return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+    }
+    static long ReadInt64BE(Stream s)
+    {
+        Span<byte> b = stackalloc byte[8];
+        s.ReadExactly(b);
+        long v = 0;
+        for (int i = 0; i < 8; i++) v = (v << 8) | b[i];
+        return v;
+    }
+    static string ReadNullTermString(Stream s)
+    {
+        var sb = new System.Text.StringBuilder();
+        int c;
+        while ((c = s.ReadByte()) > 0) sb.Append((char)c);
+        return sb.ToString();
+    }
+    static int  ReadInt32BEFromArray(byte[] a, int p) =>
+        (a[p] << 24) | (a[p+1] << 16) | (a[p+2] << 8) | a[p+3];
+    static int  ReadInt16BEFromArray(byte[] a, int p) =>
+        (a[p] << 8) | a[p+1];
+
+    // ── Language XML extraction ────────────────────────────────────────────────
+
+    /// <summary>
+    /// Scans decompressed Unity asset data for language XML documents and returns
+    /// the English one.  The English document is identified by the entry
+    ///   &lt;s l="language_english"&gt;English&lt;/s&gt;  (or t="English" variant).
+    /// </summary>
+    static byte[]? FindEnglishLanguageXml(byte[] data)
+    {
+        byte[] startTag  = Encoding.UTF8.GetBytes("<data xmlns:xsd=");
+        byte[] endTag    = Encoding.UTF8.GetBytes("</data>");
+        // Both possible English markers — whichever format the XML uses.
+        byte[] marker1   = Encoding.UTF8.GetBytes("language_english\">English<");
+        byte[] marker2   = Encoding.UTF8.GetBytes("language_english\" t=\"English\"");
+
+        for (int i = 0; i <= data.Length - startTag.Length; i++)
+        {
+            if (!SpanMatchAt(data, i, startTag)) continue;
+
+            int endIdx = SpanIndexOf(data, endTag, i + startTag.Length);
+            if (endIdx < 0) continue;
+            int docEnd = endIdx + endTag.Length;
+
+            if (SpanIndexOf(data, marker1, i, docEnd) >= 0 ||
+                SpanIndexOf(data, marker2, i, docEnd) >= 0)
+            {
+                var xml = new byte[docEnd - i];
+                Buffer.BlockCopy(data, i, xml, 0, xml.Length);
+                return xml;
+            }
+        }
+        return null;
+    }
+
+    static bool SpanMatchAt(byte[] data, int pos, byte[] pattern)
+    {
+        if (pos + pattern.Length > data.Length) return false;
+        for (int i = 0; i < pattern.Length; i++)
+            if (data[pos + i] != pattern[i]) return false;
+        return true;
+    }
+    static int SpanIndexOf(byte[] data, byte[] pattern, int start, int end = -1)
+    {
+        int limit = (end < 0 ? data.Length : end) - pattern.Length;
+        for (int i = start; i <= limit; i++)
+            if (SpanMatchAt(data, i, pattern)) return i;
+        return -1;
+    }
+
+    /// <summary>
+    /// Parses a language XML byte array exactly as Language.Init() does:
+    ///   <s l="KEY">VALUE</s>          (item.translation  — XmlText)
+    ///   <s l="KEY" t="VALUE"/>        (item.translationAttribute — t= attr)
+    /// Registers every entry in LanguageLookup with key lowercased+trimmed.
+    /// Returns the number of entries registered.
+    /// </summary>
+    static int ParseLanguageXml(byte[] xml)
+    {
+        try
+        {
+            var doc = XDocument.Parse(Encoding.UTF8.GetString(xml));
+            int count = 0;
+            foreach (var el in doc.Root?.Elements("s") ?? Enumerable.Empty<XElement>())
+            {
+                string? key = (string?)el.Attribute("l");
+                if (string.IsNullOrEmpty(key)) continue;
+
+                // Mirror Language.Init(): XmlText first, then t= attribute
+                string value = string.IsNullOrEmpty(el.Value)
+                    ? ((string?)el.Attribute("t") ?? "")
+                    : el.Value;
+
+                if (string.IsNullOrWhiteSpace(value)) continue;
+
+                LanguageLookup.Register(key, value);   // Register lowercases+trims the key
+                count++;
+            }
+            return count;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[LANG] ParseLanguageXml failed: {ex.Message}");
+            return 0;
+        }
+    }
+
     static void ParseItemXmlBooks(ISFSObject r)
     {
         if (!r.ContainsKey("xml0")) return;
@@ -2387,15 +2701,108 @@ public static class BHBot
                 ba.Uncompress(); // zlib decompress in-place
                 string xml = Encoding.UTF8.GetString(ba.Bytes);
 
+                // Dump raw XML to file for inspection
+                try
+                {
+                    string dumpPath = System.IO.Path.Combine(
+                        System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? ".",
+                        "xml_dump");
+                    System.IO.Directory.CreateDirectory(dumpPath);
+                    System.IO.File.WriteAllText(
+                        System.IO.Path.Combine(dumpPath, filename + ".txt"),
+                        xml, Encoding.UTF8);
+                }
+                catch { /* dump is best-effort */ }
+
+                // ── Model ItemRef / BaseRef name resolution ──────────────────────────
+                // ItemRef.name mirrors:
+                //   BaseRef._rawName = xml "name" attribute (a localisation key)
+                //   BaseRef.name     = Language.GetString(_rawName)
+                //                    falls back to _rawName itself when key is absent
+                //   ItemRef.name     = base.name if non-empty, else AssetsSource.name
+                //   ItemRef.ColoredName = Util.FirstCharToUpper(Language.GetString(this.name))
+                //
+                // AssetsSource is set from assetsSourceID attr OR from parent's <upgrade id="X">
+                // child — upgrade-tier items (e.g. 1081) inherit icon/name from their base (1080).
+                //
+                // Because the game's Language dictionary is only available at runtime (downloaded
+                // from the server), we cannot call Language.GetString here. Instead we use:
+                //   1. LanguageLookup (populated from local DLC cache — may be empty for item keys)
+                //   2. Icon filename PascalCase split: "OffhandShieldStrongarm" → "Offhand Shield Strongarm"
+                //   3. CleanItemKey on the localisation key as last resort
+
+                // ── Raw record struct ────────────────────────────────────────────────
                 var doc = XDocument.Parse(xml);
+
+                // Pass 1 — collect raw data from every top-level element
+                var raw = new Dictionary<int, (string? nameKey, string? iconFile, string? rarity, int assetsSourceId)>();
                 foreach (var el in doc.Root?.Elements() ?? Enumerable.Empty<XElement>())
                 {
                     if (!int.TryParse((string?)el.Attribute("id"), out int id)) continue;
-                    // statname = direct display label; fall back to name if absent
-                    string? displayName = (string?)el.Attribute("statname")
-                                       ?? (string?)el.Attribute("name");
-                    if (string.IsNullOrEmpty(displayName)) continue;
-                    ItemNameLookup.Register(id, type, displayName);
+
+                    int.TryParse((string?)el.Attribute("assetsSourceID"), out int ownAssets);
+
+                    // Merge: preserve assetsSourceId already set by a parent's <upgrade> child
+                    int inheritedAssets = raw.TryGetValue(id, out var prev) ? prev.assetsSourceId : 0;
+
+                    raw[id] = (
+                        (string?)el.Attribute("name"),
+                        (string?)el.Attribute("icon"),
+                        (string?)el.Attribute("rarity"),
+                        ownAssets > 0 ? ownAssets : inheritedAssets
+                    );
+
+                    // Pass 1b — child <upgrade id="X"> establishes X.assetsSourceId = this item
+                    // This mirrors UpdateAssetsSource() / the book's upgrade wiring.
+                    foreach (var upg in el.Elements("upgrade"))
+                    {
+                        if (!int.TryParse((string?)upg.Attribute("id"), out int childId)) continue;
+                        if (raw.TryGetValue(childId, out var childPrev))
+                        {
+                            // Child was already collected — only set assetsSourceId if not already set
+                            if (childPrev.assetsSourceId == 0)
+                                raw[childId] = (childPrev.nameKey, childPrev.iconFile, childPrev.rarity, id);
+                        }
+                        else
+                        {
+                            raw[childId] = (null, null, null, id);
+                        }
+                    }
+                }
+
+                // Pass 2 — resolve names following ItemRef.name / AssetsSource chain
+                // Mirrors: Language.GetString(_rawName) → AssetsSource.name → icon fallback
+                string? ResolveRawName(int itemId, HashSet<int>? visited = null)
+                {
+                    visited ??= new HashSet<int>();
+                    if (!visited.Add(itemId)) return null;           // cycle guard
+                    if (!raw.TryGetValue(itemId, out var d)) return null;
+
+                    // Step 1: Language lookup on the localisation key (BaseRef.name via Language.GetString)
+                    string? name = LanguageLookup.Resolve(d.nameKey);
+
+                    // Step 2: Icon PascalCase split — the icon encodes the human-readable name
+                    name ??= SplitPascalCase(Path.GetFileNameWithoutExtension(d.iconFile));
+
+                    // Step 3: Walk AssetsSource chain (ItemRef.name → AssetsSource.name)
+                    if (name == null && d.assetsSourceId > 0)
+                        name = ResolveRawName(d.assetsSourceId, visited);
+
+                    // Step 4: CleanItemKey on the localisation key (last resort)
+                    name ??= CleanItemKey(d.nameKey);
+
+                    return name;
+                }
+
+                foreach (var (id, d) in raw)
+                {
+                    // Mirror Util.FirstCharToUpper — capitalise first character
+                    string? name = ResolveRawName(id);
+                    if (string.IsNullOrEmpty(name)) continue;
+                    if (char.IsLower(name[0]))
+                        name = char.ToUpper(name[0]) + name[1..];
+
+                    ItemNameLookup.Register(id, type, name);
                     total++;
                 }
             }
@@ -2405,6 +2812,77 @@ public static class BHBot
         {
             Logger.Warn($"[XML] ParseItemXmlBooks failed: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Converts a localization key like "equipment_mainhand_1010_name" into a
+    /// readable label like "Mainhand 1010". Also passes through already-readable
+    /// strings (those that contain spaces or uppercase letters) unchanged.
+    /// </summary>
+    static string? CleanItemKey(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+
+        // Already a proper display name (has spaces, or mixed-case like "IronSword")
+        if (raw.Contains(' ') || raw.Any(char.IsUpper)) return raw;
+
+        var s = raw;
+
+        // Strip trailing localization suffixes (_name, _statname, _desc, _title)
+        foreach (var suffix in new[] { "_statname", "_name", "_desc", "_title", "_flavor" })
+        {
+            if (s.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+            {
+                s = s[..^suffix.Length];
+                break;
+            }
+        }
+
+        // Strip leading item-type prefix (equipment_, consumable_, etc.)
+        int firstUnderscore = s.IndexOf('_');
+        if (firstUnderscore > 0)
+        {
+            string prefix = s[..firstUnderscore].ToLowerInvariant();
+            if (prefix is "equipment" or "consumable" or "familiar" or "material"
+                       or "mount" or "rune" or "enchant" or "augment" or "item")
+                s = s[(firstUnderscore + 1)..];
+        }
+
+        if (string.IsNullOrWhiteSpace(s)) return null;
+
+        // Replace remaining underscores with spaces and Title Case each word
+        return System.Globalization.CultureInfo.InvariantCulture.TextInfo
+            .ToTitleCase(s.Replace('_', ' ').ToLowerInvariant());
+    }
+
+    /// <summary>
+    /// Splits a PascalCase icon filename stem into a readable label.
+    /// "OffhandShieldStrongarm" → "Offhand Shield Strongarm"
+    /// "MainhandSword1010" → "Mainhand Sword 1010"
+    /// Returns null if the input is null/empty or has no letters.
+    /// </summary>
+    static string? SplitPascalCase(string? stem)
+    {
+        if (string.IsNullOrWhiteSpace(stem)) return null;
+
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < stem.Length; i++)
+        {
+            char c = stem[i];
+            if (i > 0 && (
+                // uppercase letter after lowercase letter: "aB" → "a B"
+                (char.IsUpper(c) && char.IsLower(stem[i - 1])) ||
+                // digit after letter: "d1" → "d 1"
+                (char.IsDigit(c) && char.IsLetter(stem[i - 1])) ||
+                // letter after digit: "1A" → "1 A"
+                (char.IsLetter(c) && char.IsDigit(stem[i - 1]))))
+            {
+                sb.Append(' ');
+            }
+            sb.Append(c);
+        }
+        string result = sb.ToString().Trim();
+        return result.Length > 0 ? result : null;
     }
 
     /// <summary>

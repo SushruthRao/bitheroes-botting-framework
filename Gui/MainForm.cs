@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.IO;
 using BitHeroesClient.Bot;
 using BitHeroesClient.Config;
 using BitHeroesClient.Logging;
@@ -83,6 +84,13 @@ public sealed class MainForm : Form
     private ListBox _lootList      = null!;
     private int     _lootListCount = 0;
 
+    // Loot summary tab
+    private ListView _lootSummaryList   = null!;
+    private Label    _summaryGoldLabel  = null!;
+    private Label    _summaryExpLabel   = null!;
+    private Label    _summaryItemsLabel = null!;
+    private int      _lootSummaryTotal  = 0;
+
     // ── Dungeon debug tab ─────────────────────────────────────────────────────
 
     private ListView _dungeonObjList = null!;
@@ -128,6 +136,15 @@ public sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = Color.FromArgb(245, 245, 248);
         Font = new Font("Segoe UI", 9f);
+
+        // Use the game's own icon if available
+        try
+        {
+            const string gameExe = @"C:\Program Files (x86)\Steam\steamapps\common\Bit Heroes\Bit Heroes.exe";
+            if (File.Exists(gameExe))
+                Icon = Icon.ExtractAssociatedIcon(gameExe) ?? Icon;
+        }
+        catch { /* keep default icon */ }
 
         SuspendLayout();
 
@@ -711,6 +728,7 @@ public sealed class MainForm : Form
         tabs.TabPages.Add(BuildSessionTab());
         tabs.TabPages.Add(BuildCharacterTab());
         tabs.TabPages.Add(BuildLootTab());
+        tabs.TabPages.Add(BuildLootSummaryTab());
         parent.Controls.Add(tabs);
     }
 
@@ -864,26 +882,161 @@ public sealed class MainForm : Form
         var entry = lb.Items[e.Index] as LootEntry;
         if (entry == null) return;
 
+        bool hasEquip  = entry.Items.Any(i => i.ItemType == 1);
+        bool hasMat    = entry.Items.Any(i => i.ItemType == 2);
+        bool hasConsum = entry.Items.Any(i => i.ItemType == 4);
+        bool hasFam    = entry.Items.Any(i => i.ItemType == 6);
+        bool hasNamed  = entry.Items.Any(i => !i.IsCurrency);
+
         // Row background
         Color bg = entry.NewLevel > 0
-            ? Color.FromArgb(20, 50, 20)   // level-up = dark green bg
-            : entry.GoldDelta > 0 || entry.Items.Any(i => !i.IsCurrency)
-                ? Color.FromArgb(28, 24, 14) // rewards = dark gold bg
-                : Color.FromArgb(36, 18, 18); // loss = dark red bg
+            ? Color.FromArgb(18, 48, 18)
+            : hasNamed
+                ? Color.FromArgb(28, 24, 14)
+                : entry.GoldDelta > 0
+                    ? Color.FromArgb(22, 22, 16)
+                    : Color.FromArgb(36, 18, 18);
         using (var bgBrush = new SolidBrush(bg))
             e.Graphics.FillRectangle(bgBrush, e.Bounds);
+
+        // Left type-indicator strip (4 px wide)
+        Color strip = entry.NewLevel > 0 ? Color.FromArgb(80, 220, 80)
+                    : hasEquip            ? Color.FromArgb(220, 170, 40)
+                    : hasFam              ? Color.FromArgb(180, 80, 220)
+                    : hasConsum           ? Color.FromArgb(60, 200, 220)
+                    : hasMat              ? Color.FromArgb(100, 190, 100)
+                    : entry.GoldDelta > 0 ? Color.FromArgb(180, 175, 60)
+                                         : Color.FromArgb(180, 60, 60);
+        using (var stripBrush = new SolidBrush(strip))
+            e.Graphics.FillRectangle(stripBrush, e.Bounds.X, e.Bounds.Y, 4, e.Bounds.Height);
 
         // Row text colour
         Color fg = entry.NewLevel > 0
             ? Color.FromArgb(120, 220, 100)
-            : entry.GoldDelta > 0 || entry.Items.Count > 0
-                ? Color.FromArgb(220, 190, 100)
-                : Color.FromArgb(180, 80, 80);
+            : hasNamed
+                ? Color.FromArgb(220, 195, 115)
+                : entry.GoldDelta > 0
+                    ? Color.FromArgb(200, 200, 140)
+                    : Color.FromArgb(180, 80, 80);
 
         using var fgBrush = new SolidBrush(fg);
         e.Graphics.DrawString(entry.Summary(), e.Font!, fgBrush,
-            new RectangleF(e.Bounds.X + 4, e.Bounds.Y + 1, e.Bounds.Width - 4, e.Bounds.Height));
+            new RectangleF(e.Bounds.X + 8, e.Bounds.Y + 1, e.Bounds.Width - 8, e.Bounds.Height));
     }
+
+    private TabPage BuildLootSummaryTab()
+    {
+        var tab = new TabPage("📊 Summary") { BackColor = Color.FromArgb(16, 20, 28), Padding = new Padding(0) };
+
+        // Header: session currency totals
+        var header = new Panel
+        {
+            Dock      = DockStyle.Top,
+            Height    = 76,
+            BackColor = Color.FromArgb(22, 28, 40),
+            Padding   = new Padding(10, 6, 10, 6),
+        };
+        _summaryGoldLabel = new Label
+        {
+            Text      = "⚔  Gold Earned:   0",
+            ForeColor = Color.FromArgb(220, 185, 60),
+            Font      = new Font("Segoe UI", 9f, FontStyle.Bold),
+            Location  = new Point(10, 8),
+            AutoSize  = true,
+        };
+        _summaryExpLabel = new Label
+        {
+            Text      = "✦  EXP Earned:    0",
+            ForeColor = Color.FromArgb(100, 210, 100),
+            Font      = new Font("Segoe UI", 9f, FontStyle.Bold),
+            Location  = new Point(10, 30),
+            AutoSize  = true,
+        };
+        _summaryItemsLabel = new Label
+        {
+            Text      = "▪  Items Found:   0",
+            ForeColor = Color.FromArgb(140, 170, 220),
+            Font      = new Font("Segoe UI", 9f),
+            Location  = new Point(10, 52),
+            AutoSize  = true,
+        };
+        header.Controls.AddRange(new Control[] { _summaryGoldLabel, _summaryExpLabel, _summaryItemsLabel });
+
+        // Item breakdown list
+        _lootSummaryList = new ListView
+        {
+            Dock         = DockStyle.Fill,
+            View         = View.Details,
+            FullRowSelect = true,
+            GridLines    = false,
+            MultiSelect  = false,
+            BorderStyle  = BorderStyle.None,
+            BackColor    = Color.FromArgb(16, 20, 28),
+            ForeColor    = Color.FromArgb(210, 215, 220),
+            Font         = new Font("Consolas", 8.5f),
+            HeaderStyle  = ColumnHeaderStyle.Nonclickable,
+            OwnerDraw    = true,
+        };
+        _lootSummaryList.Columns.Add("Item",  220);
+        _lootSummaryList.Columns.Add("Count",  60);
+
+        _lootSummaryList.DrawColumnHeader += (_, e) =>
+        {
+            using var bg = new SolidBrush(Color.FromArgb(28, 34, 50));
+            e.Graphics.FillRectangle(bg, e.Bounds);
+            using var fg = new SolidBrush(Color.FromArgb(120, 135, 170));
+            e.Graphics.DrawString(e.Header!.Text, _lootSummaryList.Font, fg,
+                e.Bounds.X + 14, e.Bounds.Y + 3);
+        };
+
+        // ListView uses DrawListViewItemEventArgs: e.State is ListViewItemStates, index via e.ItemIndex
+        _lootSummaryList.DrawItem += (_, e) =>
+        {
+            bool selected = (e.State & ListViewItemStates.Selected) != 0;
+            using var bg = new SolidBrush(selected
+                ? Color.FromArgb(40, 60, 100)
+                : e.ItemIndex % 2 == 0 ? Color.FromArgb(16, 20, 28) : Color.FromArgb(20, 25, 35));
+            e.Graphics.FillRectangle(bg, e.Bounds);
+        };
+
+        _lootSummaryList.DrawSubItem += (_, e) =>
+        {
+            int type = e.Item.Tag is int t ? t : -1;
+            var font = _lootSummaryList.Font;
+            if (e.ColumnIndex == 0)
+            {
+                // Small colored chip indicating item type
+                using var chip = new SolidBrush(ItemTypeColor(type));
+                e.Graphics.FillRectangle(chip, e.Bounds.X + 3, e.Bounds.Y + 4, 6, e.Bounds.Height - 8);
+                using var fg = new SolidBrush(Color.FromArgb(210, 215, 220));
+                e.Graphics.DrawString(e.SubItem?.Text ?? "", font, fg,
+                    e.Bounds.X + 13, e.Bounds.Y + 2);
+            }
+            else
+            {
+                using var fg = new SolidBrush(Color.FromArgb(155, 160, 170));
+                e.Graphics.DrawString(e.SubItem?.Text ?? "", font, fg,
+                    e.Bounds.X + 4, e.Bounds.Y + 2);
+            }
+        };
+
+        tab.Controls.Add(_lootSummaryList);
+        tab.Controls.Add(header);
+        return tab;
+    }
+
+    private static Color ItemTypeColor(int type) => type switch
+    {
+        1  => Color.FromArgb(220, 170, 40),   // Equipment  — gold
+        2  => Color.FromArgb(100, 190, 100),  // Material   — green
+        4  => Color.FromArgb(60,  200, 220),  // Consumable — cyan
+        6  => Color.FromArgb(180, 80,  220),  // Familiar   — purple
+        8  => Color.FromArgb(200, 130, 60),   // Mount      — orange
+        9  => Color.FromArgb(80,  160, 220),  // Rune       — blue
+        11 => Color.FromArgb(220, 80,  200),  // Enchant    — pink
+        15 => Color.FromArgb(200, 220, 60),   // Augment    — yellow-green
+        _  => Color.FromArgb(130, 130, 130),  // Unknown    — gray
+    };
 
     // ── Tab layout helpers ────────────────────────────────────────────────────
 
@@ -1177,6 +1330,27 @@ public sealed class MainForm : Form
             _lootList.EndUpdate();
             if (_lootList.Items.Count > 0)
                 _lootList.TopIndex = _lootList.Items.Count - 1;
+        }
+
+        // ── Loot summary tab ─────────────────────────────────────────────────
+        _summaryGoldLabel.Text  = $"⚔  Gold Earned:   {SessionStats.GoldGained:N0}";
+        _summaryExpLabel.Text   = $"✦  EXP Earned:    {SessionStats.ExpGained:N0}";
+        _summaryItemsLabel.Text = $"▪  Items Found:   {SessionStats.TotalItems}";
+
+        var breakdown = SessionStats.GetItemBreakdown();
+        int breakdownTotal = breakdown.Sum(t => t.qty);
+        if (breakdownTotal != _lootSummaryTotal)
+        {
+            _lootSummaryTotal = breakdownTotal;
+            _lootSummaryList.BeginUpdate();
+            _lootSummaryList.Items.Clear();
+            foreach (var (name, type, qty) in breakdown)
+            {
+                var item = new ListViewItem(name) { Tag = type };
+                item.SubItems.Add(qty.ToString("N0"));
+                _lootSummaryList.Items.Add(item);
+            }
+            _lootSummaryList.EndUpdate();
         }
 
         // ── Log lines ─────────────────────────────────────────────────────────

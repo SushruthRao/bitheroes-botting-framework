@@ -49,6 +49,23 @@ public sealed class LootItem
     }
 }
 
+// ── Language string lookup (populated from DLC bundle cache) ──────────────────
+// Maps localization key → English display text.
+// Mirrors Language.GetString() in the game client.
+
+public static class LanguageLookup
+{
+    static readonly Dictionary<string, string> _strings = new();
+
+    public static void Register(string key, string value) =>
+        _strings[key.ToLowerInvariant().Trim()] = value;
+
+    public static string? Resolve(string? key) =>
+        key != null && _strings.TryGetValue(key.ToLowerInvariant().Trim(), out var v) ? v : null;
+
+    public static int Count => _strings.Count;
+}
+
 // ── Item name lookup (populated from LOAD_XMLS xml0 books) ────────────────────
 
 public static class ItemNameLookup
@@ -78,22 +95,37 @@ public sealed class LootEntry
     // One-line summary for the loot feed list
     public string Summary()
     {
-        var parts = new System.Text.StringBuilder();
-        parts.Append($"[{Time.ToLocalTime():HH:mm:ss}]  Z{ZoneId}/N{NodeId}");
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"[{Time.ToLocalTime():HH:mm:ss}]  Z{ZoneId}/N{NodeId}");
 
-        if (GoldDelta > 0)   parts.Append($"  +{GoldDelta:N0}g");
-        if (ExpDelta  > 0)   parts.Append($"  +{ExpDelta:N0}xp");
-        if (NewLevel  > 0)   parts.Append($"  ★Lv{NewLevel}");
+        if (GoldDelta > 0) sb.Append($"  +{GoldDelta:N0}g");
+        if (ExpDelta  > 0) sb.Append($"  +{ExpDelta:N0}xp");
+        if (NewLevel  > 0) sb.Append($"  ★Lv{NewLevel}");
 
-        // Bucket items by type label, e.g. "Equip×3, Famil×1"
         if (Items.Count > 0)
         {
-            var buckets = Items
-                .GroupBy(i => i.TypeLabel)
-                .Select(g => $"{g.Key}×{g.Sum(i => i.Qty)}");
-            parts.Append($"  [{string.Join(", ", buckets)}]");
+            var labels = new List<string>();
+            var unknownBuckets = new Dictionary<string, int>();
+
+            foreach (var item in Items)
+            {
+                if (item.IsCurrency) continue;
+                var name = ItemNameLookup.Resolve(item.ItemId, item.ItemType);
+                if (name != null)
+                    labels.Add(item.Qty > 1 ? $"{name}×{item.Qty}" : name);
+                else
+                {
+                    unknownBuckets.TryGetValue(item.TypeLabel, out int c);
+                    unknownBuckets[item.TypeLabel] = c + item.Qty;
+                }
+            }
+            foreach (var kv in unknownBuckets)
+                labels.Add($"{kv.Key}×{kv.Value}");
+
+            if (labels.Count > 0)
+                sb.Append($"  [{string.Join(", ", labels)}]");
         }
-        return parts.ToString();
+        return sb.ToString();
     }
 }
 
@@ -255,6 +287,32 @@ public static class SessionStats
     public  static          IReadOnlyList<TeammateInfo> CurrentTeam  => _currentTeam;
     public  static void SetTeam(IReadOnlyList<TeammateInfo> team) => _currentTeam = team;
 
+    // ── Item drop breakdown (full session, keyed by display name) ─────────────
+
+    // key = resolved item name or TypeLabel fallback; value = (itemType, totalQty)
+    private static readonly Dictionary<string, (int type, int qty)> _itemBreakdown = new();
+    private static readonly object _itemLock = new();
+
+    public static void RecordItemDrop(int itemType, string displayName, int qty)
+    {
+        lock (_itemLock)
+        {
+            if (_itemBreakdown.TryGetValue(displayName, out var existing))
+                _itemBreakdown[displayName] = (existing.type, existing.qty + qty);
+            else
+                _itemBreakdown[displayName] = (itemType, qty);
+        }
+    }
+
+    public static IReadOnlyList<(string name, int type, int qty)> GetItemBreakdown()
+    {
+        lock (_itemLock)
+            return _itemBreakdown
+                .Select(kv => (kv.Key, kv.Value.type, kv.Value.qty))
+                .OrderByDescending(t => t.qty)
+                .ToList();
+    }
+
     // ── Recent loot feed ──────────────────────────────────────────────────────
 
     private static readonly object          _lootLock   = new();
@@ -282,7 +340,13 @@ public static class SessionStats
         if (win) _encountersWon++; else _encountersLost++;
         if (loot.GoldDelta > 0) _goldGained += loot.GoldDelta;
         if (loot.ExpDelta  > 0) _expGained  += loot.ExpDelta;
-        _totalItems += loot.Items.Count(i => !i.IsCurrency);
+        var nonCurrency = loot.Items.Where(i => !i.IsCurrency).ToList();
+        _totalItems += nonCurrency.Count;
+        foreach (var item in nonCurrency)
+        {
+            var name = ItemNameLookup.Resolve(item.ItemId, item.ItemType) ?? item.TypeLabel;
+            RecordItemDrop(item.ItemType, name, item.Qty);
+        }
         lock (_lootLock)
         {
             if (_recentLoot.Count >= 50) _recentLoot.Dequeue();
@@ -373,5 +437,6 @@ public static class SessionStats
         _enemiesTotal = _enemiesCleared = 0;
         _currentTeam = Array.Empty<TeammateInfo>();
         lock (_lootLock) _recentLoot.Clear();
+        lock (_itemLock) _itemBreakdown.Clear();
     }
 }
