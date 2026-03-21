@@ -4,10 +4,10 @@
     "port": 9933
   },
   "automation": {
-    "autoClaimDailyReward": true,
+    "autoClaimDailyReward": false,
     "autoClaimDailyQuests": false,
     "autoDeclineCaptures": true,
-    "abandonOrphanedDungeon": true,
+    "abandonOrphanedDungeon": false,
     "tutorialHandling": "Warn",
     "energyWaitMinutes": 10,
     "maxRetries": 3,

@@ -109,11 +109,11 @@ You should never need to change these.
 
 | Field | Default | Description |
 |---|---|---|
-| `autoClaimDailyReward` | `true` | Claim daily login reward at session start |
+| `autoClaimDailyReward` | `false` | Claim daily login reward at session start |
 | `autoClaimDailyQuests` | `false` | Loot completed daily quests (experimental — keep false) |
 | `autoDeclineCaptures` | `true` | Auto-decline familiar capture prompts in battle |
 | `autoAssignTeammates` | `true` | Pick the strongest online friends/guildmates automatically |
-| `abandonOrphanedDungeon` | `true` | Cancel leftover dungeon sessions on login |
+| `abandonOrphanedDungeon` | `false` | Cancel leftover dungeon sessions on login |
 | `tutorialHandling` | `"Warn"` | What to do if account is in tutorial: `"Warn"` / `"Skip"` / `"Stop"` |
 | `energyWaitMinutes` | `10` | Minutes between energy checks when out of energy |
 | `maxRetries` | `3` | Retry attempts per action before idling |

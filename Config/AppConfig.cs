@@ -30,7 +30,7 @@ public enum TutorialHandling
 public sealed class AutomationConfig
 {
     /// <summary>Send CharacterDALC DAILY_REWARD at session start.</summary>
-    public bool AutoClaimDailyReward { get; set; } = true;
+    public bool AutoClaimDailyReward { get; set; } = false;
 
     /// <summary>Check and loot all completed daily quests at session start.
     /// NOTE: Disabled by default — CharacterDALC action numbers for quest check/loot
@@ -48,7 +48,7 @@ public sealed class AutomationConfig
     public bool AutoAssignTeammates { get; set; } = true;
 
     /// <summary>Cancel orphaned dungeon sessions on login rather than resuming them.</summary>
-    public bool AbandonOrphanedDungeon { get; set; } = true;
+    public bool AbandonOrphanedDungeon { get; set; } = false;
 
     /// <summary>Behaviour when the account has not yet completed the tutorial.</summary>
     public TutorialHandling TutorialHandling { get; set; } = TutorialHandling.Warn;
