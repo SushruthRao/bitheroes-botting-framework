@@ -171,15 +171,36 @@ A list of dungeon entries run in order. When the last entry finishes its `maxRun
 
 ## GUI Overview
 
-The GUI has three tabs on the right panel:
+The GUI has five tabs on the right panel:
 
 | Tab | Contents |
 |---|---|
+| **Status** | Bot state, zone/node, wave, enemy progress, retries |
+| **Session** | Runtime, run/encounter counters, gold/exp earned, items looted |
+| **Character** | Live resources with real-time regen countdowns, gold, credits, active team |
 | **Loot** | Per-encounter loot feed — item names colored by rarity |
 | **Summary** | Full-session item breakdown (name, count, rarity color) |
-| **Queue** | Edit the dungeon queue without restarting |
 
-The left panel shows live counters: state, zone/node, wave, runs, encounters, gold, exp, energy, tickets, level, and the active team.
+### Character Tab — Resources
+
+Each regenerating resource shows three pieces of information:
+
+```
+Energy:    45
+           +1/6m     next in 3:45
+Tickets:   3
+           +1/30m    next in 12:09
+Shards:    8
+           +1/45m    next in 22:33
+Tokens:    2
+           +1/2h     next in 1:14:05
+Badges:    0
+           +1/24h    ticking…
+```
+
+- The **rate badge** (`+1/6m`) is the regen interval read from the server — it only appears once the server has sent that data.
+- The **countdown** (`next in 3:45`) counts down live every 300 ms and resets automatically each time the server confirms a new tick.
+- `ticking…` means the countdown expired but the server hasn't confirmed the tick yet — it will update on the next packet.
 
 The activity log at the bottom streams all bot events. Loot lines are colored to match the game's rarity palette — common items in their usual gray, legendaries in orange, mythics brighter, etc.
 

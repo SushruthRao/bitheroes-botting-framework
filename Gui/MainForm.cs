@@ -71,14 +71,30 @@ public sealed class MainForm : Form
     private Label _levelLabel      = null!;
     private Label _itemsLabel      = null!;
     private Label _dailiesLabel    = null!;
-    // Character
-    private Label _energyText      = null!;
-    private Label _energyRegen     = null!;
-    private Label _ticketsText     = null!;
-    private Label _ticketsRegen    = null!;
-    private Label _goldLabel       = null!;
-    private Label _creditsLabel    = null!;
-    private Label _shardsLabel     = null!;
+    // Character — resources
+    private Label _energyText       = null!;
+    private Label _energyRegenRate  = null!;   // "+1/6m"
+    private Label _energyCountdown  = null!;   // "next in 3:45"
+    private Label _energyFullIn     = null!;   // "full in 8:30"
+    private Label _ticketsText      = null!;
+    private Label _ticketsRegenRate = null!;
+    private Label _ticketsCountdown = null!;
+    private Label _ticketsFullIn    = null!;
+    private Label _shardsText       = null!;
+    private Label _shardsRegenRate  = null!;
+    private Label _shardsCountdown  = null!;
+    private Label _shardsFullIn     = null!;
+    private Label _tokensText       = null!;
+    private Label _tokensRegenRate  = null!;
+    private Label _tokensCountdown  = null!;
+    private Label _tokensFullIn     = null!;
+    private Label _badgesText       = null!;
+    private Label _badgesRegenRate  = null!;
+    private Label _badgesCountdown  = null!;
+    private Label _badgesFullIn     = null!;
+    // Character — currency
+    private Label _goldLabel        = null!;
+    private Label _creditsLabel     = null!;
     private Label _highestZoneLabel = null!;
     // Loot feed
     private ListBox _lootList      = null!;
@@ -210,44 +226,20 @@ public sealed class MainForm : Form
         _stopBtn.Enabled = false;
         _stopBtn.Click += (_, _) => StopBot();
 
-        var starBtn = new Button
+        var creditLabel = new Label
         {
-            Text      = "⭐  Star on GitHub",
-            Size      = new Size(130, 32),
-            BackColor = Color.FromArgb(60, 50, 10),
-            ForeColor = Color.FromArgb(255, 210, 50),
-            FlatStyle = FlatStyle.Flat,
-            Font      = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-            Cursor    = Cursors.Hand,
+            Text      = "Made by sr03 (Github : SushruthRao/bitheroes-botting-framework)",
+            ForeColor = Color.White,
+            Font      = new Font("Segoe UI", 8.5f),
+            AutoSize  = true,
         };
-        starBtn.FlatAppearance.BorderColor = Color.FromArgb(120, 100, 20);
-        starBtn.FlatAppearance.BorderSize  = 1;
-        starBtn.Click += (_, _) =>
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
-                "https://github.com/SushruthRao/bitheroes-botting-framework")
-                { UseShellExecute = true });
 
-        var madeByLink = new LinkLabel
-        {
-            Text            = "made by sr03",
-            Font            = new Font("Segoe UI", 8.5f),
-            AutoSize        = true,
-            LinkColor       = Color.White,
-            ActiveLinkColor = Color.FromArgb(200, 200, 200),
-            DisabledLinkColor = Color.White,
-        };
-        madeByLink.LinkClicked += (_, _) =>
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
-                "https://github.com/SushruthRao")
-                { UseShellExecute = true });
-
-        panel.Controls.AddRange(new Control[] { title, _statusLabel, _startBtn, _stopBtn, starBtn, madeByLink });
+        panel.Controls.AddRange(new Control[] { title, _statusLabel, _startBtn, _stopBtn, creditLabel });
         panel.Resize += (_, _) =>
         {
-            _stopBtn.Location   = new Point(panel.Width - 12 - _stopBtn.Width, 10);
-            _startBtn.Location  = new Point(_stopBtn.Left - 8 - _startBtn.Width, 10);
-            starBtn.Location    = new Point(_startBtn.Left - 8 - starBtn.Width, 10);
-            madeByLink.Location = new Point(starBtn.Left - 8 - madeByLink.Width, 10 + (32 - madeByLink.Height) / 2);
+            _stopBtn.Location    = new Point(panel.Width - 12 - _stopBtn.Width, 10);
+            _startBtn.Location   = new Point(_stopBtn.Left - 8 - _startBtn.Width, 10);
+            creditLabel.Location = new Point(_startBtn.Left - 8 - creditLabel.Width, 10 + (32 - creditLabel.Height) / 2);
         };
         return panel;
     }
@@ -817,37 +809,18 @@ public sealed class MainForm : Form
         int y = 8;
         TabSection(scroll, "Resources", ref y);
 
-        _energyText = StatRow(scroll, "Energy:", ref y, "—");
-        _energyRegen = new Label
-        {
-            Text      = "",
-            Location  = new Point(90, y),
-            AutoSize  = true,
-            ForeColor = Color.FromArgb(80, 110, 160),
-            Font      = new Font("Segoe UI", 7.5f, FontStyle.Italic)
-        };
-        scroll.Controls.Add(_energyRegen);
-        y += 14;
-
-        _ticketsText = StatRow(scroll, "Tickets:", ref y, "—");
-        _ticketsRegen = new Label
-        {
-            Text      = "",
-            Location  = new Point(90, y),
-            AutoSize  = true,
-            ForeColor = Color.FromArgb(80, 110, 160),
-            Font      = new Font("Segoe UI", 7.5f, FontStyle.Italic)
-        };
-        scroll.Controls.Add(_ticketsRegen);
-        y += 14;
+        (_energyText,  _energyRegenRate,  _energyCountdown,  _energyFullIn)  = RegenRow(scroll, "Energy:",  ref y);
+        (_ticketsText, _ticketsRegenRate, _ticketsCountdown, _ticketsFullIn) = RegenRow(scroll, "Tickets:", ref y);
+        (_shardsText,  _shardsRegenRate,  _shardsCountdown,  _shardsFullIn)  = RegenRow(scroll, "Shards:",  ref y);
+        (_tokensText,  _tokensRegenRate,  _tokensCountdown,  _tokensFullIn)  = RegenRow(scroll, "Tokens:",  ref y);
+        (_badgesText,  _badgesRegenRate,  _badgesCountdown,  _badgesFullIn)  = RegenRow(scroll, "Badges:",  ref y);
 
         TabSection(scroll, "Currency", ref y);
-        _goldLabel        = StatRow(scroll, "Gold:",       ref y, "—");
-        _creditsLabel     = StatRow(scroll, "Credits:",    ref y, "—");
-        _shardsLabel      = StatRow(scroll, "Shards:",     ref y, "—");
+        _goldLabel        = StatRow(scroll, "Gold:",      ref y, "—");
+        _creditsLabel     = StatRow(scroll, "Credits:",   ref y, "—");
 
         TabSection(scroll, "Progression", ref y);
-        _highestZoneLabel = StatRow(scroll, "High Zone:",  ref y, "—");
+        _highestZoneLabel = StatRow(scroll, "High Zone:", ref y, "—");
 
         TabSection(scroll, "Active Team", ref y);
         scroll.Controls.Add(new Label
@@ -883,6 +856,78 @@ public sealed class MainForm : Form
 
         tab.Controls.Add(scroll);
         return tab;
+    }
+
+    /// <summary>
+    /// Builds a resource row with four labels: value, regen rate, next-tick countdown,
+    /// and time-until-full. Layout (each resource):
+    ///   Line 1: "Energy:"   "45 / 100"
+    ///   Line 2: "+1/6m"     "next in 3:45"
+    ///   Line 3: (indent)    "full in 8:30"
+    /// </summary>
+    private static (Label value, Label rate, Label countdown, Label fullIn) RegenRow(
+        Panel parent, string caption, ref int y)
+    {
+        const int capW   = 90;
+        const int valX   = capW + 10;
+        const int subX   = capW + 10;   // sub-labels share the same left edge as value
+
+        // Caption
+        parent.Controls.Add(new Label
+        {
+            Text      = caption,
+            Location  = new Point(8, y),
+            Width     = capW,
+            ForeColor = Color.FromArgb(100, 100, 115),
+            Font      = new Font("Segoe UI", 8.5f)
+        });
+
+        // Line 1 — value "45 / 100"
+        var val = new Label
+        {
+            Text     = "—",
+            Location = new Point(valX, y),
+            AutoSize = true,
+            Font     = new Font("Segoe UI", 8.5f, FontStyle.Bold)
+        };
+        parent.Controls.Add(val);
+        y += 18;
+
+        // Line 2 — rate "+1/6m" and next-tick "next in 3:45" side by side
+        var rate = new Label
+        {
+            Text      = "",
+            Location  = new Point(subX, y),
+            AutoSize  = true,
+            ForeColor = Color.FromArgb(100, 130, 180),
+            Font      = new Font("Segoe UI", 7.5f)
+        };
+        parent.Controls.Add(rate);
+
+        var countdown = new Label
+        {
+            Text      = "",
+            Location  = new Point(subX + 46, y),
+            AutoSize  = true,
+            ForeColor = Color.FromArgb(60, 150, 100),
+            Font      = new Font("Segoe UI", 7.5f, FontStyle.Italic)
+        };
+        parent.Controls.Add(countdown);
+        y += 14;
+
+        // Line 3 — full-in "full in 8:30"
+        var fullIn = new Label
+        {
+            Text      = "",
+            Location  = new Point(subX, y),
+            AutoSize  = true,
+            ForeColor = Color.FromArgb(180, 120, 40),
+            Font      = new Font("Segoe UI", 7.5f, FontStyle.Bold)
+        };
+        parent.Controls.Add(fullIn);
+        y += 16;
+
+        return (val, rate, countdown, fullIn);
     }
 
     private TabPage BuildLootTab()
@@ -1113,7 +1158,113 @@ public sealed class MainForm : Form
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Refreshes a regen resource row every 300 ms.
+    ///
+    /// Line 1 — value:     "45 / 100"  (green when full)
+    /// Line 2 — rate/next: "+1/6m"  "next in 3:45"   (hidden when full)
+    /// Line 3 — full in:   "full in 8:30:00"          ("FULL" in green when at cap)
+    /// </summary>
+    private static void RefreshRegenRow(
+        int currentValue,
+        int maxValue,
+        BitHeroesClient.Models.RegenTimer regen,
+        Label valueLabel, Label rateLabel, Label countdownLabel, Label fullInLabel)
+    {
+        // ── Unknown / no data yet ─────────────────────────────────────────────
+        if (currentValue <= 0 && maxValue <= 0)
+        {
+            valueLabel.Text      = "—";
+            valueLabel.ForeColor = SystemColors.ControlText;
+            rateLabel.Text       = "";
+            countdownLabel.Text  = "";
+            fullInLabel.Text     = "";
+            return;
+        }
 
+        // ── Value "45 / 100" ──────────────────────────────────────────────────
+        bool atCap = maxValue > 0 && currentValue >= maxValue;
+        valueLabel.Text      = maxValue > 0 ? $"{currentValue} / {maxValue}" : currentValue.ToString();
+        valueLabel.ForeColor = atCap ? Color.FromArgb(60, 160, 80) : SystemColors.ControlText;
+
+        // ── Regen rate "+1/6m" ────────────────────────────────────────────────
+        rateLabel.Text = atCap ? "" : regen.RegenRate;
+
+        // ── Next-tick countdown ───────────────────────────────────────────────
+        if (atCap)
+        {
+            countdownLabel.Text = "";
+        }
+        else
+        {
+            var timeToNext = regen.TimeToNext;
+            if (timeToNext > TimeSpan.Zero)
+            {
+                countdownLabel.Text      = $"next in {FormatShortTime(timeToNext)}";
+                countdownLabel.ForeColor = Color.FromArgb(60, 150, 100);
+            }
+            else if (regen.NextTickAt > DateTime.MinValue)
+            {
+                countdownLabel.Text      = "ticking…";
+                countdownLabel.ForeColor = Color.FromArgb(60, 150, 100);
+            }
+            else
+            {
+                countdownLabel.Text = "";
+            }
+        }
+
+        // ── Full-in label (line 3) ────────────────────────────────────────────
+        if (atCap)
+        {
+            fullInLabel.Text      = "FULL";
+            fullInLabel.ForeColor = Color.FromArgb(60, 160, 80);
+        }
+        else if (maxValue > 0)
+        {
+            var fullIn = regen.TimeUntilFull(currentValue, maxValue);
+            if (fullIn > TimeSpan.Zero)
+            {
+                fullInLabel.Text      = $"full in {FormatLongTime(fullIn)}";
+                fullInLabel.ForeColor = Color.FromArgb(180, 120, 40);
+            }
+            else if (regen.NextTickAt > DateTime.MinValue)
+            {
+                // Have max but timer not yet active — show nothing
+                fullInLabel.Text = "";
+            }
+            else
+            {
+                fullInLabel.Text = "";
+            }
+        }
+        else
+        {
+            // Max unknown yet — hide the label
+            fullInLabel.Text = "";
+        }
+    }
+
+    /// <summary>Formats a TimeSpan as M:SS or H:MM:SS (compact, for next-tick countdown).</summary>
+    private static string FormatShortTime(TimeSpan t) =>
+        t.TotalHours >= 1
+            ? $"{(int)t.TotalHours}:{t.Minutes:D2}:{t.Seconds:D2}"
+            : $"{(int)t.TotalMinutes}:{t.Seconds:D2}";
+
+    /// <summary>
+    /// Formats a TimeSpan for the "full in" label with human-readable units.
+    /// e.g. "5h 27m", "45m 30s", "3:45"
+    /// </summary>
+    private static string FormatLongTime(TimeSpan t)
+    {
+        if (t.TotalDays >= 1)
+            return $"{(int)t.TotalDays}d {t.Hours}h {t.Minutes}m";
+        if (t.TotalHours >= 1)
+            return $"{(int)t.TotalHours}h {t.Minutes}m";
+        if (t.TotalMinutes >= 1)
+            return $"{(int)t.TotalMinutes}m {t.Seconds}s";
+        return $"{t.Seconds}s";
+    }
 
     private static Label StatRow(Control parent, string caption, ref int y, string initial)
     {
@@ -1325,21 +1476,18 @@ public sealed class MainForm : Form
         _dailiesLabel.Text    = SessionStats.DailiesClaimed.ToString();
 
         // ── Character ─────────────────────────────────────────────────────────
-        int en = SessionStats.Energy;
-        _energyText.Text = en >= 0 ? en.ToString() : "—";
-        var nextEn = SessionStats.NextEnergyAt;
-        _energyRegen.Text = nextEn > DateTime.MinValue
-            ? $"next +1 @ {nextEn.ToLocalTime():HH:mm:ss}" : "";
+        // Advance local regen counters before reading values so the UI shows the
+        // up-to-date count even between server packets.
+        SessionStats.SimulateRegen();
 
-        int tk = SessionStats.Tickets;
-        _ticketsText.Text = tk >= 0 ? tk.ToString() : "—";
-        var nextTk = SessionStats.NextTicketAt;
-        _ticketsRegen.Text = nextTk > DateTime.MinValue
-            ? $"next +1 @ {nextTk.ToLocalTime():HH:mm:ss}" : "";
+        RefreshRegenRow(SessionStats.Energy,  SessionStats.EnergyMax,  SessionStats.EnergyRegen,  _energyText,  _energyRegenRate,  _energyCountdown,  _energyFullIn);
+        RefreshRegenRow(SessionStats.Tickets, SessionStats.TicketsMax, SessionStats.TicketsRegen, _ticketsText, _ticketsRegenRate, _ticketsCountdown, _ticketsFullIn);
+        RefreshRegenRow(SessionStats.Shards,  SessionStats.ShardsMax,  SessionStats.ShardsRegen,  _shardsText,  _shardsRegenRate,  _shardsCountdown,  _shardsFullIn);
+        RefreshRegenRow(SessionStats.Tokens,  SessionStats.TokensMax,  SessionStats.TokensRegen,  _tokensText,  _tokensRegenRate,  _tokensCountdown,  _tokensFullIn);
+        RefreshRegenRow(SessionStats.Badges,  SessionStats.BadgesMax,  SessionStats.BadgesRegen,  _badgesText,  _badgesRegenRate,  _badgesCountdown,  _badgesFullIn);
 
         _goldLabel.Text        = SessionStats.Gold    > 0 ? SessionStats.Gold.ToString("N0")    : "—";
         _creditsLabel.Text     = SessionStats.Credits > 0 ? SessionStats.Credits.ToString("N0") : "—";
-        _shardsLabel.Text      = SessionStats.Shards  > 0 ? SessionStats.Shards.ToString("N0")  : "—";
         _highestZoneLabel.Text = SessionStats.HighestZone > 0 ? SessionStats.HighestZone.ToString() : "—";
 
         // ── Team list ─────────────────────────────────────────────────────────

@@ -788,7 +788,7 @@ public static class BHBot
             (_auto == AutoState.EnteringDungeon || _auto == AutoState.WaitingForBattle))
         {
             const int energyPollMs = 120_000; // re-check every 2 minutes
-            var nextRegen = SessionStats.NextEnergyAt;
+            var nextRegen = SessionStats.EnergyRegen.NextTickAt;
             if (nextRegen > DateTime.MinValue && nextRegen > DateTime.UtcNow)
                 Logger.Warn($"Out of energy. Next regen at {nextRegen.ToLocalTime():HH:mm:ss}. Checking again in 2 min.");
             else
@@ -804,7 +804,7 @@ public static class BHBot
             (_auto == AutoState.EnteringDungeon || _auto == AutoState.WaitingForBattle))
         {
             const int ticketPollMs = 120_000; // re-check every 2 minutes
-            var nextRegen = SessionStats.NextTicketAt;
+            var nextRegen = SessionStats.TicketsRegen.NextTickAt;
             if (nextRegen > DateTime.MinValue && nextRegen > DateTime.UtcNow)
                 Logger.Warn($"Out of tickets. Next regen at {nextRegen.ToLocalTime():HH:mm:ss}. Checking again in 2 min.");
             else
@@ -1793,12 +1793,12 @@ public static class BHBot
         }
 
         // Pre-entry resource check: avoid wasting a retry if we already know we can't afford entry.
-        // NextEnergyAt/NextTicketAt return DateTime.MinValue until regen data has been received,
-        // so these guards only fire once we have confirmed currency state from the server.
-        if (SessionStats.Energy == 0 && SessionStats.NextEnergyAt > DateTime.MinValue)
+        // EnergyRegen.NextTickAt returns DateTime.MinValue until regen data has been received from
+        // the server, so these guards only fire once we have confirmed currency state.
+        if (SessionStats.Energy == 0 && SessionStats.EnergyRegen.NextTickAt > DateTime.MinValue)
         {
             const int pollMs = 120_000;
-            var next = SessionStats.NextEnergyAt;
+            var next = SessionStats.EnergyRegen.NextTickAt;
             Logger.Warn($"Energy is 0 — skipping entry. " +
                         $"Next regen: {(next > DateTime.UtcNow ? next.ToLocalTime().ToString("HH:mm:ss") : "unknown")}. Checking again in 2 min.");
             _auto = AutoState.EnergyWait;
@@ -1807,10 +1807,10 @@ public static class BHBot
             return;
         }
 
-        if (SessionStats.Tickets == 0 && SessionStats.NextTicketAt > DateTime.MinValue)
+        if (SessionStats.Tickets == 0 && SessionStats.TicketsRegen.NextTickAt > DateTime.MinValue)
         {
             const int pollMs = 120_000;
-            var next = SessionStats.NextTicketAt;
+            var next = SessionStats.TicketsRegen.NextTickAt;
             Logger.Warn($"Tickets are 0 — skipping entry. " +
                         $"Next regen: {(next > DateTime.UtcNow ? next.ToLocalTime().ToString("HH:mm:ss") : "unknown")}. Checking again in 2 min.");
             _auto = AutoState.EnergyWait;
@@ -2692,12 +2692,14 @@ public static class BHBot
 
             var arr = r.GetSFSArray("xml0");
             int total = 0;
+            var receivedBooks = new List<string>();
             for (int i = 0; i < arr.Size(); i++)
             {
                 var entry = arr.GetSFSObject(i);
                 if (entry == null) continue;
 
                 string filename = entry.ContainsKey("xml1") ? entry.GetUtfString("xml1") : "";
+                if (!string.IsNullOrEmpty(filename)) receivedBooks.Add(filename);
 
                 if (!entry.ContainsKey("xml2")) continue;
                 var ba = entry.GetByteArray("xml2");
@@ -2710,7 +2712,6 @@ public static class BHBot
                     try
                     {
                         var rdoc = XDocument.Parse(xml);
-                        int rank = 0;
                         foreach (var el in rdoc.Root?.Elements() ?? Enumerable.Empty<XElement>())
                         {
                             string? link  = (string?)el.Attribute("link");
@@ -2718,10 +2719,75 @@ public static class BHBot
                             int.TryParse((string?)el.Attribute("id"), out int rarId);
                             if (link != null && color != null)
                                 RarityColorLookup.Register(link, color, rarId);
-                            rank++;
                         }
                     }
                     catch { /* best effort */ }
+                    continue;
+                }
+
+                // VariableBook — resource caps and regen rates used for "full in" display.
+                // XML elements use the same name as the property (e.g. <energyMax>100</energyMax>).
+                // From VariableBookData.cs: energyMax, energyIncrease, ticketsMax, shardsMax,
+                // tokensMax, badgesMax. energyGain/ticketsGain are always 1 so we skip them.
+                if (filename == "VariableBook.xml")
+                {
+                    try
+                    {
+                        // Dump raw XML so we can inspect the actual element/attribute format
+                        try
+                        {
+                            string dumpDir = Path.Combine(
+                                Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? ".",
+                                "xml_dump");
+                            Directory.CreateDirectory(dumpDir);
+                            File.WriteAllText(Path.Combine(dumpDir, "VariableBook.xml"), xml, Encoding.UTF8);
+                        }
+                        catch { /* best-effort */ }
+
+                        var vdoc  = XDocument.Parse(xml);
+                        var vroot = vdoc.Root;
+
+                        // VariableBookData.cs structure (from decompile):
+                        //   [XmlRoot("data")]
+                        //   class VariableBookData { Variables variables; }
+                        //     class Variables { int energyMax; int energyIncrease; ... }
+                        // → actual XML: <data><variables><energyMax>100</energyMax>...</variables></data>
+                        // Prefer the <variables> child if present; fall back to root itself
+                        // for alternate server formats.
+                        var vvars = vroot?.Element("variables") ?? vroot;
+
+                        static int ReadVbInt(XElement? root, string name)
+                        {
+                            if (root == null) return 0;
+
+                            // Primary: child element with text content
+                            var child = root.Element(name);
+                            if (child != null)
+                            {
+                                if (int.TryParse(child.Value?.Trim(), out int va)) return va;
+                                // Alternate: child element with value attribute
+                                if (int.TryParse((string?)child.Attribute("value"), out int vc)) return vc;
+                            }
+
+                            // Fallback: attribute on the same element
+                            if (int.TryParse((string?)root.Attribute(name), out int vb)) return vb;
+
+                            return 0;
+                        }
+
+                        int eMax   = ReadVbInt(vvars, "energyMax");
+                        int eInc   = ReadVbInt(vvars, "energyIncrease");
+                        int tkMax  = ReadVbInt(vvars, "ticketsMax");
+                        int shMax  = ReadVbInt(vvars, "shardsMax");
+                        int tokMax = ReadVbInt(vvars, "tokensMax");
+                        int bdMax  = ReadVbInt(vvars, "badgesMax");
+
+                        SessionStats.SetVariableBookMaxes(eMax, eInc, tkMax, shMax, tokMax, bdMax);
+                        Logger.Info($"[XML] VariableBook: energyMax={eMax}(+{eInc}/lvl) " +
+                                    $"ticketsMax={tkMax} shardsMax={shMax} " +
+                                    $"tokensMax={tokMax} badgesMax={bdMax}");
+                    }
+                    catch (Exception ex) { Logger.Warn($"[XML] VariableBook parse failed: {ex.Message}"); }
                     continue;
                 }
 
@@ -2834,6 +2900,7 @@ public static class BHBot
                 }
             }
             Logger.Info($"[XML] Loaded {total} item names from xml0 books.");
+            Logger.Debug($"[XML] Books received in xml0: {string.Join(", ", receivedBooks)}");
         }
         catch (Exception ex)
         {
@@ -3490,8 +3557,13 @@ public static class BHBot
     {
         // Field names verified from Character.cs decompile.
         // chal9=gold(long), chal10=credits(long), cha27=energy(int), cha29=tickets(int),
-        // cha67=shards(int), cha28=energyUpdatedAt(ms), cha97=energyCooldownMs,
-        // cha30=ticketsUpdatedAt(ms), cha98=ticketsCooldownMs, cha94=highestZone(int)
+        // cha67=shards(int), cha71=tokens(int), cha83=badges(int)
+        // cha28=energyRemainingMs, cha97=energyCooldownMs (ms per unit)
+        // cha30=ticketsRemainingMs, cha98=ticketsCooldownMs
+        // cha68=shardsRemainingMs, cha101=shardsCooldownMs
+        // cha72=tokensRemainingMs, cha99=tokensCooldownMs
+        // cha84=badgesRemainingMs, cha100=badgesCooldownMs
+        // cha94=highestZone(int)
         try
         {
             ExtractCurrencyFields(r);
@@ -3505,17 +3577,78 @@ public static class BHBot
 
     static void ExtractCurrencyFields(ISFSObject r)
     {
+        // ── Non-regenerating currency ─────────────────────────────────────────
         if (r.ContainsKey("chal9"))  SessionStats.UpdateCurrency(gold:    r.GetLong("chal9"));
         if (r.ContainsKey("chal10")) SessionStats.UpdateCurrency(credits: r.GetLong("chal10"));
-        if (r.ContainsKey("cha27"))  SessionStats.UpdateCurrency(energy:  r.GetInt("cha27"));
-        if (r.ContainsKey("cha29"))  SessionStats.UpdateCurrency(tickets: r.GetInt("cha29"));
-        if (r.ContainsKey("cha67"))  SessionStats.UpdateCurrency(shards:  r.GetInt("cha67"));
         if (r.ContainsKey("cha5"))   SessionStats.UpdateExpAndLevel(exp:   r.GetLong("cha5"));
         if (r.ContainsKey("cha4"))   SessionStats.UpdateExpAndLevel(level: r.GetInt("cha4"));
+
+        // ── Regenerating resources ────────────────────────────────────────────
+        // cha28/cha30/cha68/cha72/cha84 = remaining ms until next +1 tick.
+        // cha97/cha98/cha101/cha99/cha100 = cooldown interval per unit (ms).
+        // When the server sends a resource value WITHOUT its timer field, the resource
+        // is at maximum capacity — record that for the "full in" calculation.
+
+        if (r.ContainsKey("cha27"))
+        {
+            int en = r.GetInt("cha27");
+            SessionStats.UpdateCurrency(energy: en);
+            if (!r.ContainsKey("cha28"))
+                SessionStats.MarkAtCap(energy: en);   // no timer → at cap
+        }
         if (r.ContainsKey("cha28") && r.ContainsKey("cha97"))
             SessionStats.UpdateEnergyRegen(r.GetLong("cha28"), r.GetLong("cha97"));
+        else if (r.ContainsKey("cha97"))
+            SessionStats.EnergyRegen.Update(-1, r.GetLong("cha97"));
+
+        if (r.ContainsKey("cha29"))
+        {
+            int tk = r.GetInt("cha29");
+            SessionStats.UpdateCurrency(tickets: tk);
+            if (!r.ContainsKey("cha30"))
+                SessionStats.MarkAtCap(tickets: tk);
+        }
         if (r.ContainsKey("cha30") && r.ContainsKey("cha98"))
             SessionStats.UpdateTicketRegen(r.GetLong("cha30"), r.GetLong("cha98"));
+        else if (r.ContainsKey("cha98"))
+            SessionStats.TicketsRegen.Update(-1, r.GetLong("cha98"));
+
+        if (r.ContainsKey("cha67"))
+        {
+            int sh = r.GetInt("cha67");
+            SessionStats.UpdateCurrency(shards: sh);
+            if (!r.ContainsKey("cha68"))
+                SessionStats.MarkAtCap(shards: sh);
+        }
+        if (r.ContainsKey("cha68") && r.ContainsKey("cha101"))
+            SessionStats.UpdateShardsRegen(r.GetLong("cha68"), r.GetLong("cha101"));
+        else if (r.ContainsKey("cha101"))
+            SessionStats.ShardsRegen.Update(-1, r.GetLong("cha101"));
+
+        if (r.ContainsKey("cha71"))
+        {
+            int tok = r.GetInt("cha71");
+            SessionStats.UpdateCurrency(tokens: tok);
+            if (!r.ContainsKey("cha72"))
+                SessionStats.MarkAtCap(tokens: tok);
+        }
+        if (r.ContainsKey("cha72") && r.ContainsKey("cha99"))
+            SessionStats.UpdateTokensRegen(r.GetLong("cha72"), r.GetLong("cha99"));
+        else if (r.ContainsKey("cha99"))
+            SessionStats.TokensRegen.Update(-1, r.GetLong("cha99"));
+
+        if (r.ContainsKey("cha83"))
+        {
+            int bd = r.GetInt("cha83");
+            SessionStats.UpdateCurrency(badges: bd);
+            if (!r.ContainsKey("cha84"))
+                SessionStats.MarkAtCap(badges: bd);
+        }
+        if (r.ContainsKey("cha84") && r.ContainsKey("cha100"))
+            SessionStats.UpdateBadgesRegen(r.GetLong("cha84"), r.GetLong("cha100"));
+        else if (r.ContainsKey("cha100"))
+            SessionStats.BadgesRegen.Update(-1, r.GetLong("cha100"));
+
         if (r.ContainsKey("cha94"))
             SessionStats.UpdateHighestZone(r.GetInt("cha94"));
     }

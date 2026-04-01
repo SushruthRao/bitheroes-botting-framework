@@ -50,8 +50,6 @@ public sealed class LootItem
 }
 
 // ── Language string lookup (populated from DLC bundle cache) ──────────────────
-// Maps localization key → English display text.
-// Mirrors Language.GetString() in the game client.
 
 public static class LanguageLookup
 {
@@ -66,14 +64,12 @@ public static class LanguageLookup
     public static int Count => _strings.Count;
 }
 
-// ── Rarity color lookup (populated from RarityBook.xml in xml0 packet) ───────
-// Maps rarity link string (e.g. "common", "rare") → ARGB uint for WinForms Color.
+// ── Rarity color lookup ───────────────────────────────────────────────────────
 
 public static class RarityColorLookup
 {
     static readonly Dictionary<string, (uint argb, int rank)> _colors = new();
 
-    /// <summary>Register a rarity link with its 6-char hex textColor and numeric rank (RarityBook id).</summary>
     public static void Register(string link, string hexColor, int rank)
     {
         if (hexColor.Length == 6 &&
@@ -81,16 +77,14 @@ public static class RarityColorLookup
             _colors[link.ToLower()] = (0xFF000000u | rgb, rank);
     }
 
-    /// <summary>Returns the ARGB color for the given rarity link, or 0 if unknown.</summary>
     public static uint GetArgb(string? link) =>
         link != null && _colors.TryGetValue(link.ToLower(), out var c) ? c.argb : 0;
 
-    /// <summary>Returns the numeric rank (higher = rarer) for the given rarity link, or -1 if unknown.</summary>
     public static int GetRank(string? link) =>
         link != null && _colors.TryGetValue(link.ToLower(), out var c) ? c.rank : -1;
 }
 
-// ── Item name lookup (populated from LOAD_XMLS xml0 books) ────────────────────
+// ── Item name lookup ──────────────────────────────────────────────────────────
 
 public static class ItemNameLookup
 {
@@ -108,19 +102,18 @@ public static class ItemNameLookup
     public static int Count => _items.Count;
 }
 
-// ── Loot entry (one battle's rewards) ──────────────────────────────────────────
+// ── Loot entry ────────────────────────────────────────────────────────────────
 
 public sealed class LootEntry
 {
     public DateTime         Time      { get; init; }
     public int              ZoneId    { get; init; }
     public int              NodeId    { get; init; }
-    public long             GoldDelta { get; init; }   // gold earned this encounter
-    public long             ExpDelta  { get; init; }   // exp  earned this encounter
-    public int              NewLevel  { get; init; }   // 0 = no level-up / unknown
+    public long             GoldDelta { get; init; }
+    public long             ExpDelta  { get; init; }
+    public int              NewLevel  { get; init; }
     public List<LootItem>   Items     { get; init; } = new();
 
-    // One-line summary for the loot feed list
     public string Summary()
     {
         var sb = new System.Text.StringBuilder();
@@ -157,7 +150,7 @@ public sealed class LootEntry
     }
 }
 
-// ── Dungeon run result ─────────────────────────────────────────────────────────
+// ── Dungeon run result ────────────────────────────────────────────────────────
 
 public sealed class DungeonResult
 {
@@ -170,7 +163,7 @@ public sealed class DungeonResult
     public int            Waves        { get; init; }
 }
 
-// ── Teammate display info ──────────────────────────────────────────────────────
+// ── Teammate display info ─────────────────────────────────────────────────────
 
 public sealed record TeammateInfo(int Id, int Type, int Power, int Stamina, int Agility, bool Online = true)
 {
@@ -178,7 +171,7 @@ public sealed record TeammateInfo(int Id, int Type, int Power, int Stamina, int 
     public string TypeName => Type == 2 ? "Familiar" : "Player";
 }
 
-// ── Daily quests ───────────────────────────────────────────────────────────────
+// ── Daily quests ──────────────────────────────────────────────────────────────
 
 public sealed class DailyQuestEntry
 {
@@ -188,16 +181,130 @@ public sealed class DailyQuestEntry
     public bool Looted    { get; init; }
 }
 
-// ── Session statistics ─────────────────────────────────────────────────────────
+// ── Regen timer ───────────────────────────────────────────────────────────────
 
 /// <summary>
-/// Live session statistics. All writes are on the bot thread.
-/// UI timer reads are also on the UI thread — no locking needed except
-/// for the RecentLoot queue which is written from bot context.
+/// Tracks a single regenerating resource's regen state.
+///
+/// Server sends two fields per resource:
+///   remainingMs  (e.g. cha28) = ms remaining until the NEXT +1 tick fires
+///   cooldownMs   (e.g. cha97) = fixed interval between consecutive ticks
+///
+/// Local simulation: ConsumeElapsedTicks() is called from the UI thread every
+/// 300 ms. When NextTickAt has passed it advances the timer and returns the
+/// number of ticks that fired so SessionStats can increment the local count.
+/// Server packets are always authoritative and overwrite local state.
 /// </summary>
+public sealed class RegenTimer
+{
+    // UTC instant when the next +1 tick will fire.
+    // Set as: DateTime.UtcNow + remainingMs each time a server packet arrives.
+    private DateTime _nextTickAt = DateTime.MinValue;
+
+    // Fixed interval between ticks (e.g. 360_000 ms = 6 min per unit).
+    private long _cooldownMs;
+
+    // ── Server update ─────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Record updated regen state from a server packet.
+    /// Pass remainingMs = -1 to update only the cooldown (rate badge) without
+    /// resetting the tick timer.
+    /// </summary>
+    public void Update(long remainingMs, long cooldownMs)
+    {
+        if (remainingMs >= 0)
+            _nextTickAt = DateTime.UtcNow.AddMilliseconds(remainingMs);
+        if (cooldownMs > 0)
+            _cooldownMs = cooldownMs;
+    }
+
+    // ── Local simulation ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Advance the timer past DateTime.UtcNow and return how many ticks elapsed.
+    /// Called by the UI thread every ~300 ms to simulate regen locally between
+    /// server confirmations. Returns 0 if the timer hasn't expired yet, or if
+    /// regen data has not been received from the server yet.
+    /// </summary>
+    public int ConsumeElapsedTicks()
+    {
+        if (_cooldownMs <= 0 || _nextTickAt == DateTime.MinValue) return 0;
+        var now = DateTime.UtcNow;
+        if (_nextTickAt > now) return 0;
+
+        // How many full intervals have passed since NextTickAt?
+        long behind = (long)(now - _nextTickAt).TotalMilliseconds;
+        int ticks = (int)(behind / _cooldownMs) + 1;
+        _nextTickAt = _nextTickAt.AddMilliseconds((long)ticks * _cooldownMs);
+        return ticks;
+    }
+
+    // ── Properties ───────────────────────────────────────────────────────────
+
+    /// <summary>UTC time of the next +1 tick. DateTime.MinValue if unknown.</summary>
+    public DateTime NextTickAt => _nextTickAt;
+
+    /// <summary>Time remaining until the next +1. Zero if already past or unknown.</summary>
+    public TimeSpan TimeToNext
+    {
+        get
+        {
+            if (_nextTickAt == DateTime.MinValue) return TimeSpan.Zero;
+            var r = _nextTickAt - DateTime.UtcNow;
+            return r > TimeSpan.Zero ? r : TimeSpan.Zero;
+        }
+    }
+
+    /// <summary>
+    /// Total wall-clock time until <paramref name="current"/> reaches
+    /// <paramref name="max"/> via regeneration.
+    /// Returns TimeSpan.Zero when already full, or when data is unavailable.
+    /// </summary>
+    public TimeSpan TimeUntilFull(int current, int max)
+    {
+        int needed = max - current;
+        if (needed <= 0 || _cooldownMs <= 0 || _nextTickAt == DateTime.MinValue)
+            return TimeSpan.Zero;
+
+        // Time to the upcoming tick, then (needed-1) more full intervals after that.
+        double totalMs = TimeToNext.TotalMilliseconds + (needed - 1) * _cooldownMs;
+        return TimeSpan.FromMilliseconds(Math.Max(0, totalMs));
+    }
+
+    /// <summary>Human-readable regen rate badge, e.g. "+1/6m" or "+1/2h30m".</summary>
+    public string RegenRate
+    {
+        get
+        {
+            if (_cooldownMs <= 0) return "";
+            var t = TimeSpan.FromMilliseconds(_cooldownMs);
+            if (t.TotalHours >= 1)
+            {
+                string mins = t.Minutes > 0 ? $"{t.Minutes}m" : "";
+                return $"+1/{(int)t.TotalHours}h{mins}";
+            }
+            if (t.TotalMinutes >= 1)
+            {
+                string secs = t.Seconds > 0 ? $"{t.Seconds}s" : "";
+                return $"+1/{(int)t.TotalMinutes}m{secs}";
+            }
+            return $"+1/{(int)t.TotalSeconds}s";
+        }
+    }
+
+    public void Reset()
+    {
+        _nextTickAt = DateTime.MinValue;
+        _cooldownMs = 0;
+    }
+}
+
+// ── Session statistics ────────────────────────────────────────────────────────
+
 public static class SessionStats
 {
-    // ── Timing ────────────────────────────────────────────────────────────────
+    // ── Timing ───────────────────────────────────────────────────────────────
 
     public static DateTime SessionStart { get; } = DateTime.UtcNow;
     public static TimeSpan Runtime      => DateTime.UtcNow - SessionStart;
@@ -220,7 +327,7 @@ public static class SessionStats
     public static int CurrentQueueIndex => _currentQueueIndex;
     public static int QueueTotal        => _queueTotal;
 
-    // ── Individual encounter counters ─────────────────────────────────────────
+    // ── Encounter counters ────────────────────────────────────────────────────
 
     private static volatile int _encountersWon;
     private static volatile int _encountersLost;
@@ -228,17 +335,19 @@ public static class SessionStats
     public static int EncountersWon  => _encountersWon;
     public static int EncountersLost => _encountersLost;
 
-    // ── Session earnings (running totals since session start) ─────────────────
+    // ── Session earnings ──────────────────────────────────────────────────────
 
-    private static long _goldGained;    // total gold earned from battles
-    private static long _expGained;     // total EXP earned from battles
+    private static long _goldGained;
+    private static long _expGained;
 
     public static long GoldGained => _goldGained;
     public static long ExpGained  => _expGained;
 
-    // ── Currency (field names from Character.cs decompile) ────────────────────
-    // chal9=gold(long), chal10=credits(long), cha5=exp(long), cha4=level(int)
-    // cha27=energy(int), cha29=tickets(int), cha67=shards(int)
+    // ── Currency / resources ──────────────────────────────────────────────────
+    // Current values — server-authoritative, also locally simulated between packets.
+    // Field names from Character.cs decompile:
+    //   chal9=gold, chal10=credits, cha5=exp, cha4=level
+    //   cha27=energy, cha29=tickets, cha67=shards, cha71=tokens, cha83=badges
 
     private static long _gold;
     private static long _credits;
@@ -247,49 +356,70 @@ public static class SessionStats
     private static volatile int _energy;
     private static volatile int _tickets;
     private static volatile int _shards;
+    private static volatile int _tokens;
+    private static volatile int _badges;
 
-    // Energy regeneration: cha28=timestamp(ms), cha97=cooldown per unit(ms)
-    private static long _energyUpdatedAt;
-    private static long _energyCooldownMs;
+    public static long Gold    => _gold;
+    public static long Credits => _credits;
+    public static long Exp     => _exp;
+    public static int  Level   => _level;
+    public static int  Energy  => _energy;
+    public static int  Tickets => _tickets;
+    public static int  Shards  => _shards;
+    public static int  Tokens  => _tokens;
+    public static int  Badges  => _badges;
 
-    // Tickets regen: cha30=timestamp, cha98=cooldown
-    private static long _ticketsUpdatedAt;
-    private static long _ticketsCooldownMs;
+    // ── Max capacity ──────────────────────────────────────────────────────────
+    // Two sources, used in priority order:
+    //   1. VariableBook values parsed from xml0 — gives base max (+ level scaling for energy).
+    //      We ignore per-character GameModifier bonuses since we don't track equipment.
+    //   2. Observed max — inferred when the server sends a resource value WITHOUT a regen
+    //      timer (cha28 absent), which the game only does when the resource is at cap.
 
-    public static long Gold     => _gold;
-    public static long Credits  => _credits;
-    public static long Exp      => _exp;
-    public static int  Level    => _level;
-    public static int  Energy   => _energy;
-    public static int  Tickets  => _tickets;
-    public static int  Shards   => _shards;
+    // VariableBook base values (populated once from ParseVariableBook)
+    private static volatile int _vbEnergyMax;       // "energyMax" XML element
+    private static volatile int _vbEnergyIncrease;  // "energyIncrease" XML element (per level)
+    private static volatile int _vbTicketsMax;       // "ticketsMax"
+    private static volatile int _vbShardsMax;        // "shardsMax"
+    private static volatile int _vbTokensMax;        // "tokensMax"
+    private static volatile int _vbBadgesMax;        // "badgesMax"
 
-    public static DateTime NextEnergyAt
-    {
-        get
-        {
-            if (_energyCooldownMs <= 0 || _energyUpdatedAt <= 0) return DateTime.MinValue;
-            var updatedUtc = DateTimeOffset.FromUnixTimeMilliseconds(_energyUpdatedAt).UtcDateTime;
-            return updatedUtc.AddMilliseconds(_energyCooldownMs);
-        }
-    }
+    // Observed maximums — updated when server confirms resource is at cap
+    private static volatile int _obsEnergyMax;
+    private static volatile int _obsTicketsMax;
+    private static volatile int _obsShardsMax;
+    private static volatile int _obsTokensMax;
+    private static volatile int _obsBadgesMax;
 
-    public static DateTime NextTicketAt
-    {
-        get
-        {
-            if (_ticketsCooldownMs <= 0 || _ticketsUpdatedAt <= 0) return DateTime.MinValue;
-            var updatedUtc = DateTimeOffset.FromUnixTimeMilliseconds(_ticketsUpdatedAt).UtcDateTime;
-            return updatedUtc.AddMilliseconds(_ticketsCooldownMs);
-        }
-    }
+    /// <summary>
+    /// Effective energy cap: VariableBook formula takes priority, observed max as fallback.
+    /// Formula from Character.cs: energyMax + (level-1) * energyIncrease + modifiers.
+    /// We omit the modifier bonus (requires full equipment parsing).
+    /// </summary>
+    public static int EnergyMax =>
+        _vbEnergyMax > 0
+            ? _vbEnergyMax + Math.Max(0, _level - 1) * _vbEnergyIncrease
+            : _obsEnergyMax;
+
+    public static int TicketsMax => _vbTicketsMax > 0 ? _vbTicketsMax : _obsTicketsMax;
+    public static int ShardsMax  => _vbShardsMax  > 0 ? _vbShardsMax  : _obsShardsMax;
+    public static int TokensMax  => _vbTokensMax  > 0 ? _vbTokensMax  : _obsTokensMax;
+    public static int BadgesMax  => _vbBadgesMax  > 0 ? _vbBadgesMax  : _obsBadgesMax;
+
+    // ── Regen timers ──────────────────────────────────────────────────────────
+
+    public static readonly RegenTimer EnergyRegen  = new();
+    public static readonly RegenTimer TicketsRegen = new();
+    public static readonly RegenTimer ShardsRegen  = new();
+    public static readonly RegenTimer TokensRegen  = new();
+    public static readonly RegenTimer BadgesRegen  = new();
 
     // ── Highest unlocked zone (cha94) ─────────────────────────────────────────
 
     private static volatile int _highestZone;
     public static int HighestZone => _highestZone;
 
-    // ── Current bot state ─────────────────────────────────────────────────────
+    // ── Bot state ─────────────────────────────────────────────────────────────
 
     private static volatile string _currentState  = "Starting...";
     private static volatile string _currentAction = "";
@@ -297,8 +427,8 @@ public static class SessionStats
     private static volatile int    _currentNode;
     private static volatile int    _currentWave;
     private static volatile int    _retryCount;
-    private static volatile int    _enemiesTotal;    // enemies in current dungeon
-    private static volatile int    _enemiesCleared;  // enemies defeated so far
+    private static volatile int    _enemiesTotal;
+    private static volatile int    _enemiesCleared;
 
     public static string CurrentState   => _currentState;
     public static string CurrentAction  => _currentAction;
@@ -315,9 +445,8 @@ public static class SessionStats
     public  static          IReadOnlyList<TeammateInfo> CurrentTeam  => _currentTeam;
     public  static void SetTeam(IReadOnlyList<TeammateInfo> team) => _currentTeam = team;
 
-    // ── Item drop breakdown (full session, keyed by display name) ─────────────
+    // ── Item drop breakdown ───────────────────────────────────────────────────
 
-    // key = resolved item name or TypeLabel fallback; value = (itemType, totalQty, rarityLink)
     private static readonly Dictionary<string, (int type, int qty, string? rarity)> _itemBreakdown = new();
     private static readonly object _itemLock = new();
 
@@ -343,7 +472,7 @@ public static class SessionStats
 
     // ── Recent loot feed ──────────────────────────────────────────────────────
 
-    private static readonly object          _lootLock   = new();
+    private static readonly object           _lootLock   = new();
     private static readonly Queue<LootEntry> _recentLoot = new();
 
     public static IReadOnlyList<LootEntry> RecentLoot
@@ -359,10 +488,6 @@ public static class SessionStats
         if (result.Victory) _wins++; else _losses++;
     }
 
-    /// <summary>
-    /// Record the result of one individual enemy encounter (battle).
-    /// goldDelta / expDelta are the amounts earned from this encounter.
-    /// </summary>
     public static void RecordEncounter(bool win, LootEntry loot)
     {
         if (win) _encountersWon++; else _encountersLost++;
@@ -372,8 +497,8 @@ public static class SessionStats
         _totalItems += nonCurrency.Count;
         foreach (var item in nonCurrency)
         {
-            var name    = ItemNameLookup.Resolve(item.ItemId, item.ItemType) ?? item.TypeLabel;
-            var rarity  = ItemNameLookup.ResolveRarity(item.ItemId, item.ItemType);
+            var name   = ItemNameLookup.Resolve(item.ItemId, item.ItemType) ?? item.TypeLabel;
+            var rarity = ItemNameLookup.ResolveRarity(item.ItemId, item.ItemType);
             RecordItemDrop(item.ItemType, name, item.Qty, rarity);
         }
         lock (_lootLock)
@@ -398,8 +523,9 @@ public static class SessionStats
         _currentWave = wave;
     }
 
-    public static void SetWave(int wave)        => _currentWave   = wave;
-    public static void SetRetryCount(int n)     => _retryCount    = n;
+    public static void SetWave(int wave)    => _currentWave   = wave;
+    public static void SetRetryCount(int n) => _retryCount    = n;
+
     public static void SetEnemyProgress(int cleared, int total)
     {
         _enemiesCleared = cleared;
@@ -412,17 +538,33 @@ public static class SessionStats
         _queueTotal        = total;
     }
 
-    /// <summary>
-    /// Update currency values. Pass -1 for any field to leave it unchanged.
-    /// </summary>
+    /// <summary>Update currency values. Pass -1 to leave a field unchanged.</summary>
     public static void UpdateCurrency(long gold = -1, long credits = -1,
-                                      int energy = -1, int tickets = -1, int shards = -1)
+                                      int energy = -1, int tickets = -1, int shards = -1,
+                                      int tokens = -1, int badges = -1)
     {
         if (gold    >= 0) _gold    = gold;
         if (credits >= 0) _credits = credits;
         if (energy  >= 0) _energy  = energy;
         if (tickets >= 0) _tickets = tickets;
         if (shards  >= 0) _shards  = shards;
+        if (tokens  >= 0) _tokens  = tokens;
+        if (badges  >= 0) _badges  = badges;
+    }
+
+    /// <summary>
+    /// Mark a resource as currently at its maximum (server sent value without a regen timer).
+    /// Stored as the observed max so TimeUntilFull() can work before VariableBook is parsed.
+    /// Pass -1 to leave a field unchanged.
+    /// </summary>
+    public static void MarkAtCap(int energy = -1, int tickets = -1, int shards = -1,
+                                 int tokens = -1, int badges = -1)
+    {
+        if (energy  > 0 && energy  > _obsEnergyMax)  _obsEnergyMax  = energy;
+        if (tickets > 0 && tickets > _obsTicketsMax) _obsTicketsMax = tickets;
+        if (shards  > 0 && shards  > _obsShardsMax)  _obsShardsMax  = shards;
+        if (tokens  > 0 && tokens  > _obsTokensMax)  _obsTokensMax  = tokens;
+        if (badges  > 0 && badges  > _obsBadgesMax)  _obsBadgesMax  = badges;
     }
 
     /// <summary>Update exp (cha5) and level (cha4).</summary>
@@ -432,16 +574,71 @@ public static class SessionStats
         if (level >= 0) _level = level;
     }
 
-    public static void UpdateEnergyRegen(long updatedAtMs, long cooldownMs)
+    /// <summary>
+    /// Store VariableBook base values parsed from the xml0 VariableBook.xml entry.
+    /// These give the server-configured resource caps (before per-character modifiers).
+    /// </summary>
+    public static void SetVariableBookMaxes(int energyMax, int energyIncrease,
+                                            int ticketsMax, int shardsMax,
+                                            int tokensMax,  int badgesMax)
     {
-        if (updatedAtMs > 0) _energyUpdatedAt  = updatedAtMs;
-        if (cooldownMs  > 0) _energyCooldownMs = cooldownMs;
+        if (energyMax      > 0) _vbEnergyMax      = energyMax;
+        if (energyIncrease > 0) _vbEnergyIncrease = energyIncrease;
+        if (ticketsMax     > 0) _vbTicketsMax      = ticketsMax;
+        if (shardsMax      > 0) _vbShardsMax       = shardsMax;
+        if (tokensMax      > 0) _vbTokensMax       = tokensMax;
+        if (badgesMax      > 0) _vbBadgesMax       = badgesMax;
     }
 
-    public static void UpdateTicketRegen(long updatedAtMs, long cooldownMs)
+    // Regen delegation
+    public static void UpdateEnergyRegen (long remainingMs, long cooldownMs) => EnergyRegen .Update(remainingMs, cooldownMs);
+    public static void UpdateTicketRegen (long remainingMs, long cooldownMs) => TicketsRegen.Update(remainingMs, cooldownMs);
+    public static void UpdateShardsRegen (long remainingMs, long cooldownMs) => ShardsRegen .Update(remainingMs, cooldownMs);
+    public static void UpdateTokensRegen (long remainingMs, long cooldownMs) => TokensRegen .Update(remainingMs, cooldownMs);
+    public static void UpdateBadgesRegen (long remainingMs, long cooldownMs) => BadgesRegen .Update(remainingMs, cooldownMs);
+
+    /// <summary>
+    /// Simulate local resource regeneration. Called from the UI thread every ~300 ms.
+    /// Advances each regen timer and increments the local resource count by the number
+    /// of ticks that have elapsed since the last call. Stops at the known cap.
+    /// Server packets always overwrite these locally-simulated values.
+    /// </summary>
+    public static void SimulateRegen()
     {
-        if (updatedAtMs > 0) _ticketsUpdatedAt  = updatedAtMs;
-        if (cooldownMs  > 0) _ticketsCooldownMs = cooldownMs;
+        int eMax = EnergyMax;
+        if (eMax > 0 && _energy < eMax)
+        {
+            int t = EnergyRegen.ConsumeElapsedTicks();
+            if (t > 0) _energy = Math.Min(_energy + t, eMax);
+        }
+
+        int tkMax = TicketsMax;
+        if (tkMax > 0 && _tickets < tkMax)
+        {
+            int t = TicketsRegen.ConsumeElapsedTicks();
+            if (t > 0) _tickets = Math.Min(_tickets + t, tkMax);
+        }
+
+        int shMax = ShardsMax;
+        if (shMax > 0 && _shards < shMax)
+        {
+            int t = ShardsRegen.ConsumeElapsedTicks();
+            if (t > 0) _shards = Math.Min(_shards + t, shMax);
+        }
+
+        int tokMax = TokensMax;
+        if (tokMax > 0 && _tokens < tokMax)
+        {
+            int t = TokensRegen.ConsumeElapsedTicks();
+            if (t > 0) _tokens = Math.Min(_tokens + t, tokMax);
+        }
+
+        int bdMax = BadgesMax;
+        if (bdMax > 0 && _badges < bdMax)
+        {
+            int t = BadgesRegen.ConsumeElapsedTicks();
+            if (t > 0) _badges = Math.Min(_badges + t, bdMax);
+        }
     }
 
     public static void UpdateHighestZone(int zone)
@@ -455,9 +652,15 @@ public static class SessionStats
         _encountersWon = _encountersLost = 0;
         _goldGained = _expGained = 0;
         _gold = _credits = _exp = 0;
-        _level = _energy = _tickets = _shards = 0;
-        _energyUpdatedAt = _energyCooldownMs = 0;
-        _ticketsUpdatedAt = _ticketsCooldownMs = 0;
+        _level = _energy = _tickets = _shards = _tokens = _badges = 0;
+        _vbEnergyMax = _vbEnergyIncrease = _vbTicketsMax = 0;
+        _vbShardsMax = _vbTokensMax = _vbBadgesMax = 0;
+        _obsEnergyMax = _obsTicketsMax = _obsShardsMax = _obsTokensMax = _obsBadgesMax = 0;
+        EnergyRegen.Reset();
+        TicketsRegen.Reset();
+        ShardsRegen.Reset();
+        TokensRegen.Reset();
+        BadgesRegen.Reset();
         _highestZone = 0;
         _currentState = "Starting...";
         _currentAction = "";
