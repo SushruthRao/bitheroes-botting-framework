@@ -1,5 +1,7 @@
 # BitHeroesBot
 
+FOR EDUCATIONAL PURPOSES ONLY !!!
+
 [![Star on GitHub](https://img.shields.io/github/stars/SushruthRao/bitheroes-botting-framework?style=social)](https://github.com/SushruthRao/bitheroes-botting-framework)
 
 A clientless automation bot for **Bit Heroes** (Steam). BitHeroesBot connects directly to the game's SmartFoxServer 2X backend, runs dungeon loops automatically, and tracks your loot — all without opening the game client.
