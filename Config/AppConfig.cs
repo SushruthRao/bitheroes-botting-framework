@@ -6,8 +6,8 @@ namespace BitHeroesClient.Config;
 
 public sealed class ConnectionConfig
 {
-    public string Host { get; set; } = "f123.bitheroesgame.com";
-    public int    Port { get; set; } = 9933;
+    public string Host { get; set; } = "f789.bitheroesgame.com";
+    public int Port { get; set; } = 9933;
 }
 
 // ── Automation ─────────────────────────────────────────────────────────────────
@@ -75,13 +75,13 @@ public sealed class AutomationConfig
 public sealed class TeammateConfig
 {
     /// <summary>Teammate entity ID (familiar ID, player char ID, etc.).</summary>
-    public int  Id       { get; set; }
+    public int Id { get; set; }
 
     /// <summary>
     /// Slot type: 1 = player/familiar, 2 = guild familiar.
     /// Matches tmts2 field in the SFS2X packet.
     /// </summary>
-    public int  Type     { get; set; } = 1;
+    public int Type { get; set; } = 1;
 
     /// <summary>
     /// Armory loadout override ID, or -1 for default.
@@ -136,13 +136,13 @@ public sealed class GuiConfig
 public sealed class LoggingConfig
 {
     /// <summary>Write log output to a file in addition to the console/dashboard.</summary>
-    public bool   LogToFile    { get; set; } = true;
+    public bool LogToFile { get; set; } = true;
 
     /// <summary>File path for the log file. Relative paths are resolved from the exe directory.</summary>
-    public string LogFile      { get; set; } = "bot.log";
+    public string LogFile { get; set; } = "bot.log";
 
     /// <summary>Emit debug-level entries (packet dumps, raw responses). Noisy.</summary>
-    public bool   VerboseMode  { get; set; } = false;
+    public bool VerboseMode { get; set; } = false;
 }
 
 // ── Root ───────────────────────────────────────────────────────────────────────
@@ -150,9 +150,9 @@ public sealed class LoggingConfig
 /// <summary>Root config model — directly maps to config.json.</summary>
 public sealed class AppConfig
 {
-    public ConnectionConfig  Connection  { get; set; } = new();
-    public AutomationConfig  Automation  { get; set; } = new();
+    public ConnectionConfig Connection { get; set; } = new();
+    public AutomationConfig Automation { get; set; } = new();
     public List<DungeonConfig> DungeonQueue { get; set; } = new() { new() };
-    public GuiConfig         Gui         { get; set; } = new();
-    public LoggingConfig     Logging     { get; set; } = new();
+    public GuiConfig Gui { get; set; } = new();
+    public LoggingConfig Logging { get; set; } = new();
 }

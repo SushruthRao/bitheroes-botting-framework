@@ -966,6 +966,7 @@ public static class BHBot
                 ScanForTeamData(r);
                 LoadLanguageStrings();
                 ParseItemXmlBooks(r);
+                DumpEquipmentSpriteData(r);
                 OnInGame?.Invoke();
                 BeginAutomation();
                 break;
@@ -2906,6 +2907,178 @@ public static class BHBot
         {
             Logger.Warn($"[XML] ParseItemXmlBooks failed: {ex.Message}");
         }
+    }
+
+    // ── Equipment sprite data dump for web character viewer ────────────────────
+
+    /// <summary>
+    /// Parses EquipmentBook.xml from the xml0 payload and dumps a JSON file
+    /// containing every equipment item's sprite/asset metadata — asset URLs,
+    /// body parts, offsets, layering flags, gender filters, etc.
+    /// The output is consumed by the web-based character equipment viewer.
+    /// </summary>
+    static void DumpEquipmentSpriteData(ISFSObject r)
+    {
+        if (!r.ContainsKey("xml0")) return;
+        try
+        {
+            // ParseItemXmlBooks already decompressed and dumped the XML to disk.
+            // Reading from that file avoids double-Uncompress on the same ByteArray.
+            string xmlDumpDir = Path.Combine(
+                Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? ".",
+                "xml_dump");
+            string xmlFile = Path.Combine(xmlDumpDir, "EquipmentBook.xml.txt");
+            if (!File.Exists(xmlFile))
+            {
+                Logger.Warn("[SpriteDump] EquipmentBook.xml.txt not found in xml_dump/");
+                return;
+            }
+            string equipXml = File.ReadAllText(xmlFile, Encoding.UTF8);
+
+            var doc = XDocument.Parse(equipXml);
+
+            // Equipment type string→int mapping (mirrors EquipmentRef.EQUIPMENT_TYPES)
+            static string TypeToSlotName(string? type) => (type?.ToLowerInvariant()) switch
+            {
+                "mainhand"  => "mainhand",
+                "offhand"   => "offhand",
+                "head"      => "head",
+                "body"      => "body",
+                "neck"      => "neck",
+                "ring"      => "ring",
+                "accessory" => "accessory",
+                "pet"       => "pet",
+                _           => type ?? "unknown",
+            };
+            static int TypeToInt(string? type) => (type?.ToLowerInvariant()) switch
+            {
+                "mainhand"  => 1,
+                "offhand"   => 2,
+                "head"      => 3,
+                "body"      => 4,
+                "neck"      => 5,
+                "ring"      => 6,
+                "accessory" => 7,
+                "pet"       => 8,
+                _           => 0,
+            };
+
+            // Build JSON array
+            var sb = new StringBuilder();
+            sb.AppendLine("[");
+            bool firstItem = true;
+            int count = 0;
+
+            foreach (var el in doc.Root?.Elements("equipment") ?? Enumerable.Empty<XElement>())
+            {
+                string? idStr = (string?)el.Attribute("id");
+                if (!int.TryParse(idStr, out int id)) continue;
+
+                string? nameKey      = (string?)el.Attribute("name");
+                string? icon         = (string?)el.Attribute("icon");
+                string? typeStr      = (string?)el.Attribute("type");
+                string? rarity       = (string?)el.Attribute("rarity");
+                string? subtypes     = (string?)el.Attribute("subtypes");
+                int.TryParse((string?)el.Attribute("power"),   out int power);
+                int.TryParse((string?)el.Attribute("stamina"), out int stamina);
+                int.TryParse((string?)el.Attribute("agility"), out int agility);
+
+                // Resolve display name via LanguageLookup or icon filename
+                string? displayName = LanguageLookup.Resolve(nameKey)
+                                   ?? SplitPascalCase(Path.GetFileNameWithoutExtension(icon))
+                                   ?? CleanItemKey(nameKey);
+                if (!string.IsNullOrEmpty(displayName) && char.IsLower(displayName[0]))
+                    displayName = char.ToUpper(displayName[0]) + displayName[1..];
+
+                // Collect <asset> children
+                var assets = new List<string>();
+                foreach (var assetEl in el.Elements("asset"))
+                {
+                    string? url      = (string?)assetEl.Attribute("url");
+                    string? bodyPart = (string?)assetEl.Attribute("bodyPart");
+                    string? offset   = (string?)assetEl.Attribute("offset");
+                    string? showSkin = (string?)assetEl.Attribute("showSkin");
+                    string? underSk  = (string?)assetEl.Attribute("underSkin");
+                    string? showHair = (string?)assetEl.Attribute("showHair");
+                    string? overall  = (string?)assetEl.Attribute("overall");
+                    string? genders  = (string?)assetEl.Attribute("genders");
+                    string? order    = (string?)assetEl.Attribute("order");
+                    string? def      = (string?)assetEl.Attribute("definition");
+
+                    // Parse offset "x,y" into two floats
+                    float ox = 0, oy = 0;
+                    if (offset != null)
+                    {
+                        var parts = offset.Split(',');
+                        if (parts.Length >= 2)
+                        {
+                            float.TryParse(parts[0], System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture, out ox);
+                            float.TryParse(parts[1], System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture, out oy);
+                        }
+                    }
+
+                    var asb = new StringBuilder();
+                    asb.Append('{');
+                    asb.Append($"\"url\":{JsonEsc(url)}");
+                    asb.Append($",\"bodyPart\":{JsonEsc(bodyPart)}");
+                    asb.Append($",\"offsetX\":{ox.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+                    asb.Append($",\"offsetY\":{oy.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+                    if (showSkin != null) asb.Append($",\"showSkin\":{JsonEsc(showSkin)}");
+                    if (underSk != null)  asb.Append($",\"underSkin\":{JsonEsc(underSk)}");
+                    if (showHair != null) asb.Append($",\"showHair\":{JsonEsc(showHair)}");
+                    if (overall != null)  asb.Append($",\"overall\":{JsonEsc(overall)}");
+                    if (genders != null)  asb.Append($",\"genders\":{JsonEsc(genders)}");
+                    if (order != null)    asb.Append($",\"order\":{JsonEsc(order)}");
+                    if (def != null)      asb.Append($",\"definition\":{JsonEsc(def)}");
+                    asb.Append('}');
+                    assets.Add(asb.ToString());
+                }
+
+                if (!firstItem) sb.AppendLine(",");
+                firstItem = false;
+
+                sb.Append("  {");
+                sb.Append($"\"id\":{id}");
+                sb.Append($",\"name\":{JsonEsc(displayName)}");
+                sb.Append($",\"nameKey\":{JsonEsc(nameKey)}");
+                sb.Append($",\"icon\":{JsonEsc(icon)}");
+                sb.Append($",\"type\":{JsonEsc(typeStr)}");
+                sb.Append($",\"typeId\":{TypeToInt(typeStr)}");
+                sb.Append($",\"slotName\":{JsonEsc(TypeToSlotName(typeStr))}");
+                sb.Append($",\"rarity\":{JsonEsc(rarity)}");
+                sb.Append($",\"subtypes\":{JsonEsc(subtypes)}");
+                sb.Append($",\"power\":{power},\"stamina\":{stamina},\"agility\":{agility}");
+                sb.Append($",\"assets\":[{string.Join(",", assets)}]");
+                sb.Append('}');
+                count++;
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("]");
+
+            string dumpDir = Path.Combine(
+                Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? ".",
+                "sprite_dump");
+            Directory.CreateDirectory(dumpDir);
+            string outPath = Path.Combine(dumpDir, "equipment_sprites.json");
+            File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8);
+            Logger.Info($"[SpriteDump] Dumped {count} equipment items with sprite data → {outPath}");
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[SpriteDump] DumpEquipmentSpriteData failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>JSON-escapes a string value, returning "null" for null inputs.</summary>
+    static string JsonEsc(string? s)
+    {
+        if (s == null) return "null";
+        return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"")
+                        .Replace("\n", "\\n").Replace("\r", "\\r")
+                        .Replace("\t", "\\t") + "\"";
     }
 
     /// <summary>
